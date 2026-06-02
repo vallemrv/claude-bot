@@ -1,5 +1,5 @@
 """
-SQLite persistence for cloude-bot.
+SQLite persistence for claude-bot.
 
 Claude persists the real conversation state on disk (~/.claude/projects/...),
 so we only track:

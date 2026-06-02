@@ -1,4 +1,4 @@
-# cloude-bot 🤖
+# claude-bot 🤖
 
 Control remoto de **Claude Code por Telegram** — clon de `opencode-bot` adaptado a
 Claude. Habla con Claude desde el móvil, gestiona múltiples proyectos y sesiones, ve
@@ -55,7 +55,7 @@ Requisitos: `claude` CLI con sesión iniciada, Python 3.11+. Para audio: `XAI_AP
 
 ## Dejarlo siempre activo
 
-Ver `cloude-bot.service.example` (servicio systemd de usuario).
+Ver `claude-bot.service.example` (servicio systemd de usuario).
 
 ## 🔒 Seguridad
 

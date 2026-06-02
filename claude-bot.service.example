@@ -1,0 +1,24 @@
+# Servicio systemd de USUARIO para claude-bot.
+# Instalación:
+#   mkdir -p ~/.config/systemd/user
+#   cp claude-bot.service.example ~/.config/systemd/user/claude-bot.service
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now claude-bot.service
+#   loginctl enable-linger $USER   # para que siga tras cerrar sesión
+#
+# Logs:   journalctl --user -u claude-bot -f
+
+[Unit]
+Description=claude-bot - Claude Code por Telegram
+After=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/valle/proyectos/claude-bot
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/home/valle/proyectos/claude-bot/.venv/bin/python /home/valle/proyectos/claude-bot/src/telegram_bot.py
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=default.target

@@ -78,6 +78,21 @@ def build_mcp_server():
     return create_sdk_mcp_server(name="bot", version="1.0.0", tools=[_ask_user])
 
 
+# Appended to Claude Code's default system prompt so it actually *uses* the
+# ask_user tool. Without this, Claude silently makes its own choices and the
+# operator never sees a question on Telegram.
+ASK_USER_GUIDANCE = (
+    "Estás operando a través de un bot de Telegram con un único operador humano. "
+    "Cuando necesites una decisión, una aclaración, o haya una ambigüedad real que "
+    "cambie el resultado (qué archivo, qué enfoque, datos que faltan, una acción "
+    "destructiva o irreversible), DEBES preguntar usando la herramienta "
+    "`mcp__bot__ask_user` y esperar la respuesta, en lugar de suponer o continuar a "
+    "ciegas. Pasa la pregunta en `question` y, si aplica, una lista de respuestas "
+    "sugeridas separadas por comas en `options`. No abuses: para tareas claras y sin "
+    "ambigüedad, trabaja directamente sin preguntar. Responde siempre en español."
+)
+
+
 # --------------------------------------------------------------------------- #
 # Event normalization
 # --------------------------------------------------------------------------- #
@@ -152,6 +167,13 @@ async def run(prompt: str, cwd: str, model: str | None, resume_session_id: str |
     if mcp_server is not None:
         kwargs["mcp_servers"] = {"bot": mcp_server}
         kwargs["allowed_tools"] = ["mcp__bot__ask_user"]
+        # Instruct Claude to actually ask via the tool when it needs a decision,
+        # otherwise the operator never gets a question on Telegram.
+        kwargs["system_prompt"] = {
+            "type": "preset",
+            "preset": "claude_code",
+            "append": ASK_USER_GUIDANCE,
+        }
     # The interactive permission callback only matters when not bypassing.
     if can_use_tool is not None and permission_mode != "bypassPermissions":
         kwargs["can_use_tool"] = can_use_tool

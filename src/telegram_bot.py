@@ -1,5 +1,5 @@
 """
-cloude-bot — Telegram remote control for Claude Code (clone of opencode-bot).
+claude-bot — Telegram remote control for Claude Code (clone of opencode-bot).
 
 Architecture:
 - Claude Agent SDK replaces the OpenCode server + SSE.
@@ -39,7 +39,7 @@ import claude_client as cc
 load_dotenv(Path(__file__).parent.parent / ".env")
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
-logger = logging.getLogger("cloude-bot")
+logger = logging.getLogger("claude-bot")
 
 TOKEN     = os.environ["TELEGRAM_BOT_TOKEN"]
 ADMIN_ID  = int(os.environ["TELEGRAM_ADMIN_ID"])
@@ -47,8 +47,8 @@ WORKSPACE = Path(os.getenv("DEFAULT_WORKSPACE", "~/proyectos")).expanduser()
 DEFAULT_PERMISSION_MODE = os.getenv("PERMISSION_MODE", "bypassPermissions")
 TASK_TIMEOUT = int(os.getenv("TASK_TIMEOUT", "1800"))
 BOT_DIR = str(Path(__file__).parent.parent.resolve())
-TMP_DIR = Path("/tmp/cloude-bot-media")
-RESTART_FLAG = Path("/tmp/cloude-bot-restarting.flag")
+TMP_DIR = Path("/tmp/claude-bot-media")
+RESTART_FLAG = Path("/tmp/claude-bot-restarting.flag")
 
 MCP_SERVER = cc.build_mcp_server()
 
@@ -1042,7 +1042,7 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 # /start /help /restart
 # --------------------------------------------------------------------------- #
 HELP = (
-    "*cloude-bot* — Claude Code por Telegram\n\n"
+    "*claude-bot* — Claude Code por Telegram\n\n"
     "/open — navegar carpetas, abrir proyecto / sesión\n"
     "/sessions — gestionar sesiones de un proyecto\n"
     "/projects — proyectos con sesiones\n"
@@ -1082,11 +1082,11 @@ async def cmd_restart(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     msg = await update.message.reply_text("🔄 Reiniciando…")
     RESTART_FLAG.write_text(str(msg.message_id))
     import subprocess
-    r = subprocess.run(["systemctl", "--user", "restart", "cloude-bot.service"],
+    r = subprocess.run(["systemctl", "--user", "restart", "claude-bot.service"],
                        capture_output=True, text=True)
     if r.returncode != 0:
         RESTART_FLAG.unlink(missing_ok=True)
-        await msg.edit_text("⚠️ No hay servicio systemd `cloude-bot.service`.\n"
+        await msg.edit_text("⚠️ No hay servicio systemd `claude-bot.service`.\n"
                             "Reinícialo a mano con `./run.sh`.", parse_mode="Markdown")
 
 
@@ -1161,7 +1161,7 @@ def main():
                 RESTART_FLAG.unlink(missing_ok=True)
 
     app.post_init = post_init
-    logger.info("cloude-bot starting (permission_mode=%s, workspace=%s)",
+    logger.info("claude-bot starting (permission_mode=%s, workspace=%s)",
                 PERMISSION_MODE, WORKSPACE)
     app.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
 
