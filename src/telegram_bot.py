@@ -1247,20 +1247,25 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 @admin_only
 async def cmd_restart(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    import subprocess
+    service = "claude-bot.service"
+    # Existence check that finishes *before* anything kills us (unlike a plain
+    # `restart`, whose own systemctl gets SIGTERM'd inside the service cgroup
+    # and falsely reports failure). `cat` → rc 0 if the unit exists.
+    exists = subprocess.run(["systemctl", "--user", "cat", service],
+                            capture_output=True, text=True).returncode == 0
+    if not exists:
+        await update.message.reply_text(
+            "⚠️ No hay servicio systemd `claude-bot.service`.\n"
+            "Reinícialo a mano con `./run.sh`.", parse_mode="Markdown")
+        return
     msg = await update.message.reply_text("🔄 Reiniciando…")
     RESTART_FLAG.write_text(str(msg.message_id))
-    import subprocess
-    # --no-block: enqueue the restart and return immediately. Without it, this
-    # `systemctl` process (it lives in the service's own cgroup) gets killed
-    # mid-restart, so subprocess.run sees a non-zero code and wrongly reports
-    # "no existe el servicio" even though the restart actually goes through.
-    r = subprocess.run(
-        ["systemctl", "--user", "restart", "--no-block", "claude-bot.service"],
-        capture_output=True, text=True)
-    if r.returncode != 0:
-        RESTART_FLAG.unlink(missing_ok=True)
-        await msg.edit_text("⚠️ No hay servicio systemd `claude-bot.service`.\n"
-                            "Reinícialo a mano con `./run.sh`.", parse_mode="Markdown")
+    # Detach the restart into its own transient unit (separate cgroup) so it
+    # survives when systemd stops this service. Fire-and-forget; the success
+    # message is shown by post_init via RESTART_FLAG once we come back up.
+    subprocess.Popen(["systemd-run", "--user", "--collect",
+                      "systemctl", "--user", "restart", service])
 
 
 # --------------------------------------------------------------------------- #
