@@ -195,3 +195,62 @@ async def run(prompt: str, cwd: str, model: str | None, resume_session_id: str |
             await client.disconnect()
         except Exception:  # noqa: BLE001
             pass
+
+
+# --------------------------------------------------------------------------- #
+# /btw — side questions (sees context, no tools, doesn't touch session history)
+# --------------------------------------------------------------------------- #
+# Claude Code built-in tools blocked for side questions so the answer comes
+# straight from context (fast + ephemeral, like /btw in the CLI).
+SIDE_DISALLOWED = [
+    "Task", "Bash", "BashOutput", "KillBash", "Glob", "Grep", "Read",
+    "Edit", "MultiEdit", "Write", "NotebookEdit", "WebFetch", "WebSearch",
+    "TodoWrite", "ExitPlanMode", "SlashCommand",
+]
+
+BTW_GUIDANCE = (
+    "Esto es una PREGUNTA RÁPIDA al margen (estilo /btw). Responde de forma breve y "
+    "directa USANDO SOLO lo que ya está en el contexto de esta conversación. NO uses "
+    "herramientas, NO leas archivos, NO ejecutes comandos. Si la respuesta no está en "
+    "el contexto, dilo claramente. Responde en español."
+)
+
+
+async def ask_side(prompt: str, cwd: str, model: str | None,
+                   resume_session_id: str | None):
+    """One-shot side question. Forks the resumed session (the original stays
+    untouched), blocks tools, answers from context only. Yields normalized
+    events; the forked session id arrives in 'session'/'result' so the caller
+    can delete it afterward."""
+    kwargs = dict(
+        cwd=cwd,
+        permission_mode="bypassPermissions",
+        setting_sources=["user", "project", "local"],
+        disallowed_tools=SIDE_DISALLOWED,
+        max_turns=2,
+        system_prompt={
+            "type": "preset", "preset": "claude_code", "append": BTW_GUIDANCE,
+        },
+    )
+    if model:
+        kwargs["model"] = model
+    if resume_session_id:
+        kwargs["resume"] = resume_session_id
+        kwargs["fork_session"] = True
+
+    options = ClaudeAgentOptions(**kwargs)
+    client = ClaudeSDKClient(options=options)
+    await client.connect()
+    try:
+        await client.query(prompt)
+        async for msg in client.receive_response():
+            for ev in _normalize(msg):
+                yield ev
+    except Exception as exc:  # noqa: BLE001
+        logger.error(f"claude ask_side error: {exc}", exc_info=True)
+        yield {"type": "error", "message": str(exc)}
+    finally:
+        try:
+            await client.disconnect()
+        except Exception:  # noqa: BLE001
+            pass

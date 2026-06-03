@@ -743,6 +743,70 @@ async def cmd_rename(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"✅ Sesión renombrada: `{title}`", parse_mode="Markdown")
 
 
+@admin_only
+async def cmd_btw(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Side question (à la /btw): sees the active session's context, no tools,
+    doesn't touch its history (forks + deletes a throwaway session)."""
+    active = db.get_active()
+    if not active:
+        await update.message.reply_text("⚠️ No hay sesión activa. Usa /open.")
+        return
+    sid = active.get("claude_session_id")
+    if not sid:
+        await update.message.reply_text(
+            "⚠️ La sesión activa aún no tiene contexto (envía un primer prompt).")
+        return
+    question = " ".join(ctx.args).strip()
+    if not question:
+        await update.message.reply_text(
+            "Uso: `/btw <pregunta>`\nPregunta rápida sobre la sesión activa "
+            "(ve el contexto, sin herramientas, no afecta al historial).",
+            parse_mode="Markdown")
+        return
+
+    directory = active["directory"]
+    model = active.get("model") or cc.DEFAULT_MODEL
+    status = await update.message.reply_text("💬 _Pensando \\(btw\\)…_",
+                                             parse_mode="MarkdownV2")
+    answer = ""
+    forked_sid = None
+    try:
+        async for ev in cc.ask_side(question, directory, model, sid):
+            t = ev["type"]
+            if t == "session":
+                forked_sid = ev["session_id"]
+            elif t == "text":
+                answer += ev["text"]
+            elif t == "result":
+                forked_sid = forked_sid or ev.get("session_id")
+                if not answer:
+                    answer = ev.get("text", "")
+            elif t == "error":
+                answer = answer or f"❌ {ev['message'][:800]}"
+    except Exception as exc:  # noqa: BLE001
+        answer = f"❌ {exc}"
+
+    # Drop the throwaway forked session so it never clutters the pickers.
+    if forked_sid and forked_sid != sid:
+        try:
+            sdk.delete_session(forked_sid, directory=directory)
+        except Exception:  # noqa: BLE001
+            pass
+        db.forget_session(forked_sid)
+
+    out = "💬 *BTW* — no afecta al historial\n\n" + (answer or "(sin respuesta)")
+    chunks = [out[i:i+3800] for i in range(0, len(out), 3800)] or [out]
+    try:
+        await status.edit_text(md2tgv2.convert(chunks[0]), parse_mode="MarkdownV2")
+    except BadRequest:
+        await status.edit_text(chunks[0])
+    for c in chunks[1:]:
+        try:
+            await APP.bot.send_message(ADMIN_ID, md2tgv2.convert(c), parse_mode="MarkdownV2")
+        except BadRequest:
+            await APP.bot.send_message(ADMIN_ID, c)
+
+
 PERM_MODES = ["bypassPermissions", "acceptEdits", "default", "plan"]
 
 
@@ -1150,6 +1214,7 @@ HELP = (
     "/projects — proyectos con sesiones\n"
     "/models — cambiar modelo (opus/sonnet/haiku)\n"
     "/rename — renombrar la sesión activa (`/rename mi nombre`)\n"
+    "/btw — pregunta rápida sobre la sesión, sin tocar su historial\n"
     "/permisos — modo de permisos\n"
     "/multisesion — pregunta destino en cada mensaje\n"
     "/exitmulti — salir de multisesión\n"
@@ -1213,6 +1278,7 @@ def main():
     app.add_handler(CommandHandler("close", cmd_close))
     app.add_handler(CommandHandler("models", cmd_models))
     app.add_handler(CommandHandler("rename", cmd_rename))
+    app.add_handler(CommandHandler("btw", cmd_btw))
     app.add_handler(CommandHandler("permisos", cmd_permisos))
     app.add_handler(CommandHandler("multisesion", cmd_multisesion))
     app.add_handler(CommandHandler("exitmulti", cmd_exitmulti))
@@ -1252,6 +1318,7 @@ def main():
             BotCommand("projects", "Proyectos con sesiones"),
             BotCommand("models", "Cambiar modelo"),
             BotCommand("rename", "Renombrar sesión activa"),
+            BotCommand("btw", "Pregunta rápida (no afecta historial)"),
             BotCommand("permisos", "Modo de permisos"),
             BotCommand("multisesion", "Preguntar destino en cada mensaje"),
             BotCommand("exitmulti", "Salir de multisesión"),
