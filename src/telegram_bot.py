@@ -496,23 +496,31 @@ async def cb_os(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await _show_model_picker(q, cwd)
 
 
-async def _show_session_picker(q, cwd: str, sessions: list):
+async def _show_session_picker(q, cwd: str, sessions: list, mode: str = "activate"):
     pk = _key(cwd)
-    active = db.get_active()
-    active_sid = (active or {}).get("claude_session_id")
-    btns = [[InlineKeyboardButton("➕ Nueva sesión", callback_data=f"newsess:{pk}")]]
+    if mode == "send":
+        new_cb = f"sendnew:{pk}"
+        cur_sid = (SEND_MODE.get("target") or {}).get("skey")
+        title = f"📤 `{Path(cwd).name}` — {len(sessions)} sesión(es) (destino)"
+        sel = lambda sid: f"sendsess:{_key(sid)}:{pk}"
+        dele = lambda sid: f"senddel:{_key(sid)}:{pk}"
+    else:
+        new_cb = f"newsess:{pk}"
+        cur_sid = (db.get_active() or {}).get("claude_session_id")
+        title = f"📂 `{Path(cwd).name}` — {len(sessions)} sesión(es)"
+        sel = lambda sid: f"actsess:{_key(sid)}:{pk}"
+        dele = lambda sid: f"delsess:{_key(sid)}:{pk}"
+    btns = [[InlineKeyboardButton("➕ Nueva sesión", callback_data=new_cb)]]
     for s in sessions[:10]:
         sid = s.session_id
-        mark = " ✅" if sid == active_sid else ""
+        mark = " ✅" if sid == cur_sid else ""
         btns.append([
-            InlineKeyboardButton(f"{_session_label(s)[:28]}{mark}",
-                                 callback_data=f"actsess:{_key(sid)}:{pk}"),
-            InlineKeyboardButton("🗑", callback_data=f"delsess:{_key(sid)}:{pk}"),
+            InlineKeyboardButton(f"{_session_label(s)[:28]}{mark}", callback_data=sel(sid)),
+            InlineKeyboardButton("🗑", callback_data=dele(sid)),
         ])
     btns.append([InlineKeyboardButton("❌ Cancelar", callback_data="cancel:")])
     await q.edit_message_text(
-        f"📂 `{Path(cwd).name}` — {len(sessions)} sesión(es)",
-        reply_markup=InlineKeyboardMarkup(btns), parse_mode="Markdown")
+        title, reply_markup=InlineKeyboardMarkup(btns), parse_mode="Markdown")
 
 
 async def _show_model_picker(q, cwd: str | None):
@@ -912,13 +920,20 @@ async def cb_sendpick(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await q.answer()
     cwd = _val(int(q.data.split(":")[1]))
     sessions = _list_sessions(directory=cwd)
-    btns = []
-    for s in sessions[:10]:
-        btns.append([InlineKeyboardButton(_session_label(s)[:30],
-                                          callback_data=f"sendsess:{_key(s.session_id)}:{_key(cwd)}")])
-    btns.append([InlineKeyboardButton("❌ Cancelar", callback_data="cancel:")])
-    await q.edit_message_text(f"📂 `{Path(cwd).name}` — elige sesión:",
-                              reply_markup=InlineKeyboardMarkup(btns), parse_mode="Markdown")
+    await _show_session_picker(q, cwd, sessions, mode="send")
+
+
+async def _send_to_target(q, cwd: str, skey: str, model: str, label: str):
+    """Set the send target and either fire the queued text or wait for the message."""
+    SEND_MODE["target"] = {"skey": skey, "directory": cwd, "model": model}
+    pending = SEND_MODE.pop("pending_text", None)
+    SEND_MODE["pending_text"] = None
+    if pending:
+        await q.edit_message_text(f"📤 Enviando a {label}…", parse_mode="Markdown")
+        await _dispatch(cwd, skey, model, pending)
+    else:
+        await q.edit_message_text(
+            f"📤 Destino: {label}\n🧩 `{model}`\nEscribe el mensaje.", parse_mode="Markdown")
 
 
 async def cb_sendsess(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -929,15 +944,50 @@ async def cb_sendsess(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     cwd = _val(int(parts[2]))
     meta = db.get_session_meta(sid)
     model = (meta or {}).get("model") or cc.DEFAULT_MODEL
-    SEND_MODE["target"] = {"skey": sid, "directory": cwd, "model": model}
-    pending = SEND_MODE.pop("pending_text", None)
-    SEND_MODE["pending_text"] = None
-    if pending:
-        await q.edit_message_text(f"📤 Enviando a `{Path(cwd).name}`…", parse_mode="Markdown")
-        await _dispatch(cwd, sid, model, pending)
-    else:
-        await q.edit_message_text(
-            f"📤 Destino: `{Path(cwd).name}`\nEscribe el mensaje.", parse_mode="Markdown")
+    await _send_to_target(q, cwd, sid, model, f"`{Path(cwd).name}`")
+
+
+async def cb_sendnew(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """➕ Nueva sesión in send mode → pick a model for the new target session."""
+    q = update.callback_query
+    await q.answer()
+    pk = int(q.data.split(":")[1])
+    cwd = _val(pk)
+    btns = [[InlineKeyboardButton("🧩 " + m, callback_data=f"sendmodel:{pk}:{_key(m)}")]
+            for m in cc.MODELS]
+    btns.append([InlineKeyboardButton("❌ Cancelar", callback_data="cancel:")])
+    await q.edit_message_text(
+        f"📤 `{Path(cwd).name}` — nueva sesión\n🧩 Elige modelo:",
+        reply_markup=InlineKeyboardMarkup(btns), parse_mode="Markdown")
+
+
+async def cb_sendmodel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Model chosen for a new send-target session (materializes on first prompt)."""
+    q = update.callback_query
+    await q.answer()
+    parts = q.data.split(":")
+    cwd = _val(int(parts[1]))
+    model = _val(int(parts[2]))
+    await _send_to_target(q, cwd, _skey(cwd, None), model,
+                          f"nueva sesión en `{Path(cwd).name}`")
+
+
+async def cb_senddel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Delete a session from the send picker, then re-render it."""
+    q = update.callback_query
+    await q.answer()
+    parts = q.data.split(":")
+    sid = _val(int(parts[1]))
+    cwd = _val(int(parts[2])) if len(parts) > 2 else ""
+    try:
+        sdk.delete_session(sid, directory=cwd or None)
+    except Exception as exc:  # noqa: BLE001
+        await q.edit_message_text(f"❌ Error: {exc}")
+        return
+    db.forget_session(sid)
+    if (SEND_MODE.get("target") or {}).get("skey") == sid:
+        SEND_MODE["target"] = None
+    await _show_session_picker(q, cwd, _list_sessions(directory=cwd), mode="send")
 
 
 @admin_only
@@ -1174,6 +1224,9 @@ def main():
     app.add_handler(CallbackQueryHandler(cb_q_custom, pattern=r"^qc:"))
     app.add_handler(CallbackQueryHandler(cb_sendpick, pattern=r"^sendpick:"))
     app.add_handler(CallbackQueryHandler(cb_sendsess, pattern=r"^sendsess:"))
+    app.add_handler(CallbackQueryHandler(cb_sendnew, pattern=r"^sendnew:"))
+    app.add_handler(CallbackQueryHandler(cb_sendmodel, pattern=r"^sendmodel:"))
+    app.add_handler(CallbackQueryHandler(cb_senddel, pattern=r"^senddel:"))
     app.add_handler(CallbackQueryHandler(cb_abort, pattern=r"^abort:"))
     app.add_handler(CallbackQueryHandler(cb_cancel, pattern=r"^cancel:"))
 
