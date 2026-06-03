@@ -902,7 +902,7 @@ def _clear_send_mode() -> bool:
 
 
 @admin_only
-async def cmd_send(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+async def cmd_multisesion(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     SEND_MODE["on"] = True
     by_dir = _group_by_dir(_list_sessions())
     btns = [[InlineKeyboardButton(f"📂 {Path(d).name} ({len(by_dir[d])})",
@@ -910,9 +910,10 @@ async def cmd_send(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             for d in sorted(by_dir)]
     btns.append([InlineKeyboardButton("❌ Cancelar", callback_data="cancel:")])
     await update.message.reply_text(
-        "📤 *Modo send* — preguntará destino en *cada* mensaje (no cambia la "
-        "sesión activa). Responde a un mensaje del bot para seguir esa sesión.\n"
-        "/endsend para salir.", reply_markup=InlineKeyboardMarkup(btns),
+        "🔀 *Modo multisesión activo* — preguntaré el destino en *cada* mensaje "
+        "(no cambia la sesión activa). Responde a un mensaje del bot para seguir "
+        "esa sesión concreta.\n\n⚠️ Sigues en multisesión hasta que pongas "
+        "/exitmulti.", reply_markup=InlineKeyboardMarkup(btns),
         parse_mode="Markdown")
 
 
@@ -931,7 +932,9 @@ async def _send_to_target(q, cwd: str, skey: str, model: str, label: str):
     SEND_MODE["pending_text"] = None
     if pending:
         SEND_MODE["target"] = None  # one message per pick → re-ask next time
-        await q.edit_message_text(f"📤 Enviando a {label}…", parse_mode="Markdown")
+        await q.edit_message_text(
+            f"📤 Enviando a {label}…\n_🔀 Sigues en multisesión · /exitmulti para salir_",
+            parse_mode="Markdown")
         await _dispatch(cwd, skey, model, pending)
     else:
         # /send invoked without text yet: hold this destination for the very
@@ -996,11 +999,12 @@ async def cb_senddel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 @admin_only
-async def cmd_endsend(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+async def cmd_exitmulti(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if _clear_send_mode():
-        await update.message.reply_text("📤 Modo send desactivado.")
+        await update.message.reply_text("✅ Modo multisesión desactivado. "
+                                        "Vuelves a tu sesión activa.")
     else:
-        await update.message.reply_text("No estabas en modo send.")
+        await update.message.reply_text("No estabas en modo multisesión.")
 
 
 # --------------------------------------------------------------------------- #
@@ -1118,7 +1122,7 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         model = (meta or {}).get("model") or _active_model()
     elif SEND_MODE["on"] and SEND_MODE["target"] is None:
         SEND_MODE["pending_text"] = text
-        await cmd_send(update, ctx)
+        await cmd_multisesion(update, ctx)
         return
     elif SEND_MODE["target"]:
         t = SEND_MODE["target"]
@@ -1147,8 +1151,8 @@ HELP = (
     "/models — cambiar modelo (opus/sonnet/haiku)\n"
     "/rename — renombrar la sesión activa (`/rename mi nombre`)\n"
     "/permisos — modo de permisos\n"
-    "/send — modo que pregunta destino en cada mensaje\n"
-    "/endsend — salir del modo send\n"
+    "/multisesion — pregunta destino en cada mensaje\n"
+    "/exitmulti — salir de multisesión\n"
     "/close — borrar sesiones de un proyecto\n"
     "/esc — cancelar la tarea en curso\n"
     "/restart — reiniciar el bot\n\n"
@@ -1210,8 +1214,8 @@ def main():
     app.add_handler(CommandHandler("models", cmd_models))
     app.add_handler(CommandHandler("rename", cmd_rename))
     app.add_handler(CommandHandler("permisos", cmd_permisos))
-    app.add_handler(CommandHandler("send", cmd_send))
-    app.add_handler(CommandHandler("endsend", cmd_endsend))
+    app.add_handler(CommandHandler("multisesion", cmd_multisesion))
+    app.add_handler(CommandHandler("exitmulti", cmd_exitmulti))
     app.add_handler(CommandHandler("esc", cmd_esc))
     app.add_handler(CommandHandler("restart", cmd_restart))
 
@@ -1249,8 +1253,8 @@ def main():
             BotCommand("models", "Cambiar modelo"),
             BotCommand("rename", "Renombrar sesión activa"),
             BotCommand("permisos", "Modo de permisos"),
-            BotCommand("send", "Enviar a otro proyecto"),
-            BotCommand("endsend", "Salir de modo send"),
+            BotCommand("multisesion", "Preguntar destino en cada mensaje"),
+            BotCommand("exitmulti", "Salir de multisesión"),
             BotCommand("close", "Cerrar proyecto"),
             BotCommand("esc", "Cancelar tarea"),
             BotCommand("restart", "Reiniciar bot"),
