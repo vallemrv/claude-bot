@@ -1250,8 +1250,13 @@ async def cmd_restart(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     msg = await update.message.reply_text("🔄 Reiniciando…")
     RESTART_FLAG.write_text(str(msg.message_id))
     import subprocess
-    r = subprocess.run(["systemctl", "--user", "restart", "claude-bot.service"],
-                       capture_output=True, text=True)
+    # --no-block: enqueue the restart and return immediately. Without it, this
+    # `systemctl` process (it lives in the service's own cgroup) gets killed
+    # mid-restart, so subprocess.run sees a non-zero code and wrongly reports
+    # "no existe el servicio" even though the restart actually goes through.
+    r = subprocess.run(
+        ["systemctl", "--user", "restart", "--no-block", "claude-bot.service"],
+        capture_output=True, text=True)
     if r.returncode != 0:
         RESTART_FLAG.unlink(missing_ok=True)
         await msg.edit_text("⚠️ No hay servicio systemd `claude-bot.service`.\n"
