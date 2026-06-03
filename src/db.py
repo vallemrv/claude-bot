@@ -124,6 +124,18 @@ def set_session_model(claude_session_id: str, model: str) -> None:
         )
 
 
+def set_session_title(claude_session_id: str, title: str) -> None:
+    """Set a custom title for a session (upsert; survives later prompts)."""
+    if not claude_session_id:
+        return
+    with _conn() as con:
+        con.execute("""
+            INSERT INTO session_meta (claude_session_id, directory, model, title, created_at)
+            VALUES (?, '', NULL, ?, ?)
+            ON CONFLICT(claude_session_id) DO UPDATE SET title = excluded.title
+        """, (claude_session_id, title, time.time()))
+
+
 def forget_session(claude_session_id: str) -> None:
     with _conn() as con:
         con.execute(

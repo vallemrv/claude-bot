@@ -112,8 +112,13 @@ def _resume_for(skey: str) -> str | None:
 
 
 def _session_label(s) -> str:
+    sid = getattr(s, "session_id", "")
+    if sid:
+        meta = db.get_session_meta(sid)
+        if meta and meta.get("title"):
+            return meta["title"]
     return (getattr(s, "custom_title", None) or getattr(s, "summary", None)
-            or getattr(s, "first_prompt", None) or getattr(s, "session_id", "")[:8]
+            or getattr(s, "first_prompt", None) or sid[:8]
             or "sesión")
 
 
@@ -239,9 +244,18 @@ async def _send_reply(skey: str, directory: str, st: dict, final: dict | None):
     cost = (final or {}).get("cost", 0.0)
     files = st.get("files_edited", set())
 
+    session_id = _resume_for(skey)
+    session_title = None
+    if session_id:
+        meta = db.get_session_meta(session_id)
+        session_title = (meta or {}).get("title")
+    
     header = f"✅ `{cwd_name}` | 🧩 `{model}` | ⏱ `{elapsed}`"
     if cost:
         header += f" | 💲`{cost:.4f}`"
+    if session_title:
+        truncated_title = session_title[:25] + ("..." if len(session_title) > 25 else "")
+        header += f"\n📌 `{truncated_title}`"
     if files:
         names = list(files)[:3]
         header += " 📝 " + ", ".join(f"`{f}`" for f in names)
@@ -383,6 +397,10 @@ async def _dispatch(directory: str, skey: str, model: str, text: str):
             f"⏳ `{Path(directory).name}` ocupado. En cola (posición {pos}).",
             parse_mode="Markdown")
         return
+
+    # Reserve the slot synchronously before any await to prevent a second
+    # message slipping through the STATUSES check during the Telegram round-trip.
+    STATUSES[skey] = {"state": "reserving"}
 
     sent = await APP.bot.send_message(
         ADMIN_ID,
@@ -573,8 +591,12 @@ async def cb_delsess(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if sessions:
         await _show_session_picker(q, cwd, sessions)
     else:
-        await q.edit_message_text(f"✅ Sesión borrada. No quedan en `{Path(cwd).name}`.",
-                                  parse_mode="Markdown")
+        db.set_active(cwd, None, cc.DEFAULT_MODEL)
+        await q.edit_message_text(
+            f"✅ Sesión borrada.\n"
+            f"📌 Nueva sesión creada automáticamente en `{Path(cwd).name}`\n"
+            f"🧩 `{cc.DEFAULT_MODEL}`",
+            parse_mode="Markdown")
 
 
 async def cb_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -691,6 +713,26 @@ async def cmd_models(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"🧩 Modelo actual: `{cur}`\nElige:",
                                     reply_markup=InlineKeyboardMarkup(btns),
                                     parse_mode="Markdown")
+
+
+@admin_only
+async def cmd_rename(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    active = db.get_active()
+    if not active:
+        await update.message.reply_text("⚠️ No hay sesión activa. Usa /open.")
+        return
+    sid = active.get("claude_session_id")
+    if not sid:
+        await update.message.reply_text(
+            "⚠️ La sesión aún no existe (envía un primer prompt antes de renombrarla).")
+        return
+    title = " ".join(ctx.args).strip()
+    if not title:
+        await update.message.reply_text("Uso: `/rename <nuevo nombre>`", parse_mode="Markdown")
+        return
+    title = title[:60]
+    db.set_session_title(sid, title)
+    await update.message.reply_text(f"✅ Sesión renombrada: `{title}`", parse_mode="Markdown")
 
 
 PERM_MODES = ["bypassPermissions", "acceptEdits", "default", "plan"]
@@ -1047,6 +1089,7 @@ HELP = (
     "/sessions — gestionar sesiones de un proyecto\n"
     "/projects — proyectos con sesiones\n"
     "/models — cambiar modelo (opus/sonnet/haiku)\n"
+    "/rename — renombrar la sesión activa (`/rename mi nombre`)\n"
     "/permisos — modo de permisos\n"
     "/send — enviar a otro proyecto (persistente)\n"
     "/endsend — salir del modo send\n"
@@ -1109,6 +1152,7 @@ def main():
     app.add_handler(CommandHandler("projects", cmd_projects))
     app.add_handler(CommandHandler("close", cmd_close))
     app.add_handler(CommandHandler("models", cmd_models))
+    app.add_handler(CommandHandler("rename", cmd_rename))
     app.add_handler(CommandHandler("permisos", cmd_permisos))
     app.add_handler(CommandHandler("send", cmd_send))
     app.add_handler(CommandHandler("endsend", cmd_endsend))
@@ -1144,6 +1188,7 @@ def main():
             BotCommand("sessions", "Gestionar sesiones"),
             BotCommand("projects", "Proyectos con sesiones"),
             BotCommand("models", "Cambiar modelo"),
+            BotCommand("rename", "Renombrar sesión activa"),
             BotCommand("permisos", "Modo de permisos"),
             BotCommand("send", "Enviar a otro proyecto"),
             BotCommand("endsend", "Salir de modo send"),
