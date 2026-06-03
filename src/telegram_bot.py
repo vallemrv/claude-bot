@@ -910,7 +910,8 @@ async def cmd_send(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             for d in sorted(by_dir)]
     btns.append([InlineKeyboardButton("❌ Cancelar", callback_data="cancel:")])
     await update.message.reply_text(
-        "📤 *Modo send* — elige proyecto destino (no cambia la sesión activa).\n"
+        "📤 *Modo send* — preguntará destino en *cada* mensaje (no cambia la "
+        "sesión activa). Responde a un mensaje del bot para seguir esa sesión.\n"
         "/endsend para salir.", reply_markup=InlineKeyboardMarkup(btns),
         parse_mode="Markdown")
 
@@ -924,14 +925,18 @@ async def cb_sendpick(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 async def _send_to_target(q, cwd: str, skey: str, model: str, label: str):
-    """Set the send target and either fire the queued text or wait for the message."""
-    SEND_MODE["target"] = {"skey": skey, "directory": cwd, "model": model}
+    """Route one message to the chosen destination. The target is transient:
+    after dispatch it is cleared so the next clean message asks again."""
     pending = SEND_MODE.pop("pending_text", None)
     SEND_MODE["pending_text"] = None
     if pending:
+        SEND_MODE["target"] = None  # one message per pick → re-ask next time
         await q.edit_message_text(f"📤 Enviando a {label}…", parse_mode="Markdown")
         await _dispatch(cwd, skey, model, pending)
     else:
+        # /send invoked without text yet: hold this destination for the very
+        # next message only (handle_text clears it once that message is sent).
+        SEND_MODE["target"] = {"skey": skey, "directory": cwd, "model": model}
         await q.edit_message_text(
             f"📤 Destino: {label}\n🧩 `{model}`\nEscribe el mensaje.", parse_mode="Markdown")
 
@@ -1118,6 +1123,7 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     elif SEND_MODE["target"]:
         t = SEND_MODE["target"]
         directory, skey, model = t["directory"], t["skey"], t["model"]
+        SEND_MODE["target"] = None  # transient: next clean message re-asks
     else:
         active = db.get_active()
         if not active or not active.get("directory"):
@@ -1141,7 +1147,7 @@ HELP = (
     "/models — cambiar modelo (opus/sonnet/haiku)\n"
     "/rename — renombrar la sesión activa (`/rename mi nombre`)\n"
     "/permisos — modo de permisos\n"
-    "/send — enviar a otro proyecto (persistente)\n"
+    "/send — modo que pregunta destino en cada mensaje\n"
     "/endsend — salir del modo send\n"
     "/close — borrar sesiones de un proyecto\n"
     "/esc — cancelar la tarea en curso\n"
