@@ -24,7 +24,7 @@ from telegram.ext import (
     Application, CommandHandler, MessageHandler,
     CallbackQueryHandler, ContextTypes, filters,
 )
-from telegram.error import BadRequest, RetryAfter
+from telegram.error import BadRequest, RetryAfter, NetworkError
 
 import claude_agent_sdk as sdk
 
@@ -276,6 +276,8 @@ async def _update_status(skey: str, force: bool = False):
         pass
     except RetryAfter as e:
         await asyncio.sleep(e.retry_after)
+    except NetworkError:
+        pass
 
 
 async def _heartbeat(ctx: ContextTypes.DEFAULT_TYPE):
