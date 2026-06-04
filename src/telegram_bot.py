@@ -122,6 +122,60 @@ def _session_label(s) -> str:
             or "sesión")
 
 
+def _find_session(sid: str, cwd: str):
+    """Return the SDK session object for sid, or None."""
+    for s in _list_sessions(directory=cwd):
+        if s.session_id == sid:
+            return s
+    return None
+
+
+def _context_bar(file_size: int) -> str:
+    """Rough context-usage indicator from conversation JSONL file size.
+    Heuristic: ~1 token per 6 bytes (JSON overhead); 200K window for all models."""
+    est = file_size // 6
+    pct = min(99, est * 100 // 200_000)
+    icon = "🟢" if pct < 40 else ("🟡" if pct < 70 else ("🟠" if pct < 90 else "🔴"))
+    kb = file_size / 1024
+    size_str = f"{kb:.0f} KB" if kb < 1024 else f"{kb / 1024:.1f} MB"
+    tip = " — considera sesión nueva" if pct >= 80 else ""
+    return f"{icon} ctx ~{pct}% ({size_str}){tip}"
+
+
+def _session_card(s, meta: dict | None, cwd: str) -> str:
+    """Multi-line session summary used in activation messages and restart notice."""
+    model = (meta or {}).get("model") or cc.DEFAULT_MODEL
+    title = (_session_label(s).replace("`", "'").replace("*", "·"))[:50]
+    branch = getattr(s, "git_branch", None)
+    last_mod = getattr(s, "last_modified", None)
+    file_size = getattr(s, "file_size", 0) or 0
+
+    dir_line = f"📂 `{Path(cwd).name}`"
+    if branch:
+        dir_line += f"  🌿 `{branch}`"
+
+    ago_str = ""
+    if last_mod:
+        ago = time.time() - last_mod / 1000
+        if ago < 60:
+            ago_str = "ahora mismo"
+        elif ago < 3600:
+            ago_str = f"hace {int(ago // 60)} min"
+        elif ago < 86400:
+            ago_str = f"hace {int(ago // 3600)} h"
+        else:
+            ago_str = f"hace {int(ago // 86400)} d"
+
+    lines = [
+        dir_line,
+        f"🧩 `{model}`" + (f"  🕐 {ago_str}" if ago_str else ""),
+        f"💬 {title}",
+    ]
+    if file_size:
+        lines.append(_context_bar(file_size))
+    return "\n".join(lines)
+
+
 def _list_sessions(directory: str | None = None) -> list:
     try:
         return sdk.list_sessions(directory=directory)
@@ -576,8 +630,13 @@ async def cb_actsess(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     meta = db.get_session_meta(sid)
     model = (meta or {}).get("model") or cc.DEFAULT_MODEL
     db.set_active(cwd, sid, model)
-    await q.edit_message_text(f"✅ Sesión activa\n📂 `{Path(cwd).name}`\n🧩 `{model}`",
-                              parse_mode="Markdown")
+    s = _find_session(sid, cwd)
+    if s:
+        await q.edit_message_text(f"✅ *Sesión activa*\n{_session_card(s, meta, cwd)}",
+                                  parse_mode="Markdown")
+    else:
+        await q.edit_message_text(f"✅ Sesión activa\n📂 `{Path(cwd).name}`\n🧩 `{model}`",
+                                  parse_mode="Markdown")
 
 
 async def cb_delsess(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -1230,11 +1289,19 @@ HELP = (
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     active = db.get_active()
     if active:
-        cwd = Path(active["directory"]).name
-        sid = active.get("claude_session_id") or "(nueva)"
-        model = active.get("model") or cc.DEFAULT_MODEL
-        head = (f"*Sesión activa*\n📂 `{cwd}`\n📦 `{sid[:12] if sid != '(nueva)' else sid}`\n"
-                f"🧩 `{model}` | 🔐 `{PERMISSION_MODE}`\n\n")
+        sid = active.get("claude_session_id")
+        cwd = active["directory"]
+        meta = db.get_session_meta(sid) if sid else None
+        model = (meta or {}).get("model") or active.get("model") or cc.DEFAULT_MODEL
+        s = _find_session(sid, cwd) if sid else None
+        if s:
+            head = (f"*Sesión activa*\n{_session_card(s, meta, cwd)}\n"
+                    f"🔐 `{PERMISSION_MODE}`\n\n")
+        else:
+            label = "(nueva)" if not sid else sid[:12]
+            head = (f"*Sesión activa*\n📂 `{Path(cwd).name}`\n"
+                    f"🧩 `{model}` | 🔐 `{PERMISSION_MODE}`\n"
+                    f"📦 `{label}`\n\n")
     else:
         head = f"⚠️ Sin sesión activa · 🔐 `{PERMISSION_MODE}`\n\n"
     await update.message.reply_text(head + HELP, parse_mode="Markdown")
@@ -1340,8 +1407,25 @@ def main():
             try:
                 mid = int(RESTART_FLAG.read_text().strip())
                 RESTART_FLAG.unlink(missing_ok=True)
-                await application.bot.edit_message_text(chat_id=ADMIN_ID, message_id=mid,
-                                                        text="✅ Bot reiniciado.")
+                lines = ["✅ *Bot reiniciado*"]
+                active = db.get_active()
+                if active and active.get("claude_session_id"):
+                    sid = active["claude_session_id"]
+                    cwd = active["directory"]
+                    meta = db.get_session_meta(sid)
+                    s = _find_session(sid, cwd)
+                    if s:
+                        lines.append(f"\n*Sesión activa:*\n{_session_card(s, meta, cwd)}")
+                    else:
+                        model = (meta or {}).get("model") or cc.DEFAULT_MODEL
+                        lines.append(f"\n📂 `{Path(cwd).name}` · 🧩 `{model}`")
+                elif active:
+                    cwd = active.get("directory", "")
+                    model = active.get("model") or cc.DEFAULT_MODEL
+                    lines.append(f"\n📂 `{Path(cwd).name}` · 🧩 `{model}` · (nueva sesión)")
+                await application.bot.edit_message_text(
+                    chat_id=ADMIN_ID, message_id=mid,
+                    text="\n".join(lines), parse_mode="Markdown")
             except Exception:  # noqa: BLE001
                 RESTART_FLAG.unlink(missing_ok=True)
 
