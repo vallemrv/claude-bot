@@ -477,19 +477,22 @@ async def _dispatch(directory: str, skey: str, model: str, text: str):
     # message slipping through the STATUSES check during the Telegram round-trip.
     STATUSES[skey] = {"state": "reserving"}
 
-    sent = await APP.bot.send_message(
-        ADMIN_ID,
-        f"⚪ *ESPERANDO* | 📂 `{Path(directory).name}`\n"
-        f"🧩 `{model}` | ⏱ `00:00`\n\n_Pulsa_ /esc _para cancelar_",
-        parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup([[
-            InlineKeyboardButton("❌ Cancelar", callback_data="abort:")]]))
     resume_sid = _resume_for(skey)
     sess_label = None
     if resume_sid:
         s = _find_session(resume_sid, directory)
         if s:
             sess_label = _session_label(s)
+
+    sess_line = f"\n💬 `{sess_label[:40]}`" if sess_label else ""
+    sent = await APP.bot.send_message(
+        ADMIN_ID,
+        f"⚪ *ESPERANDO* | 📂 `{Path(directory).name}`\n"
+        f"🧩 `{model}` | ⏱ `00:00`{sess_line}\n"
+        f"_Iniciando Claude Code…_\n\n_Pulsa_ /esc _para cancelar_",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("❌ Cancelar", callback_data="abort:")]]))
     _start_status(skey, directory, sent.message_id, model, sess_label)
     _track_msg(sent.message_id, skey, directory)
     RUNNING[skey] = {"client": None, "directory": directory}
@@ -1120,7 +1123,10 @@ async def cb_sendsess(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     cwd = _val(int(parts[2]))
     meta = db.get_session_meta(sid)
     model = (meta or {}).get("model") or cc.DEFAULT_MODEL
-    await _send_to_target(q, cwd, sid, model, f"`{Path(cwd).name}`")
+    s = _find_session(sid, cwd)
+    sess_name = _session_label(s).replace("`", "'")[:35] if s else sid[:8]
+    label = f"`{Path(cwd).name}` › {sess_name}"
+    await _send_to_target(q, cwd, sid, model, label)
 
 
 async def cb_sendnew(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
