@@ -64,7 +64,8 @@ KNOWN_SID: dict = {}       # skey -> real claude session id once known
 KEYSTORE: dict = {}        # int -> str   (compress long strings for callback_data)
 PENDING_PERMS: dict = {}   # qid -> asyncio.Future
 PENDING_Q: dict = {}       # qid -> {"future", "options": [str]}
-SEND_MODE = {"on": False, "target": None, "pending_text": None}
+SEND_MODE = {"on": False, "target": None, "pending_text": None,
+             "oneshot": False, "oneshot_pre": False}
 MKDIR_PENDING: dict = {}   # {"path","msg_id"}
 
 STATUS_INTERVAL = 10
@@ -587,15 +588,24 @@ async def _show_session_picker(q, cwd: str, sessions: list, mode: str = "activat
         title = f"📤 `{Path(cwd).name}` — {len(sessions)} sesión(es) (destino)"
         sel = lambda sid: f"sendsess:{_key(sid)}:{pk}"
         dele = lambda sid: f"senddel:{_key(sid)}:{pk}"
-    else:
+    elif mode == "sessions":
         new_cb = f"newsess:{pk}"
         cur_sid = (db.get_active() or {}).get("claude_session_id")
         title = f"📂 `{Path(cwd).name}` — {len(sessions)} sesión(es)"
         if cur_sid:
             active_s = _find_session(cur_sid, cwd)
             if active_s:
-                active_label = _session_label(active_s).replace("`", "'")[:50]
-                title += f"\n✅ {active_label}"
+                title += f"\n✅ {_session_label(active_s).replace('`', chr(39))[:50]}"
+        sel = lambda sid: f"actsess:{_key(sid)}:{pk}"
+        dele = lambda sid: f"delsess:{_key(sid)}:{pk}:s"  # :s → re-render in sessions mode
+    else:  # activate (from /open)
+        new_cb = f"newsess:{pk}"
+        cur_sid = (db.get_active() or {}).get("claude_session_id")
+        title = f"📂 `{Path(cwd).name}` — {len(sessions)} sesión(es)"
+        if cur_sid:
+            active_s = _find_session(cur_sid, cwd)
+            if active_s:
+                title += f"\n✅ {_session_label(active_s).replace('`', chr(39))[:50]}"
         sel = lambda sid: f"actsess:{_key(sid)}:{pk}"
         dele = lambda sid: f"delsess:{_key(sid)}:{pk}"
     btns = [[InlineKeyboardButton("➕ Nueva sesión", callback_data=new_cb)]]
@@ -608,6 +618,10 @@ async def _show_session_picker(q, cwd: str, sessions: list, mode: str = "activat
             InlineKeyboardButton(label, callback_data=sel(sid)),
             InlineKeyboardButton("🗑", callback_data=dele(sid)),
         ])
+    if mode in ("send", "sessions"):
+        label_back = "🔙 Otro proyecto"
+        cb_back = "sendback:" if mode == "send" else "sessback:"
+        btns.append([InlineKeyboardButton(label_back, callback_data=cb_back)])
     btns.append([InlineKeyboardButton("❌ Cancelar", callback_data="cancel:")])
     await q.edit_message_text(
         title, reply_markup=InlineKeyboardMarkup(btns), parse_mode="Markdown")
@@ -682,6 +696,7 @@ async def cb_delsess(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     parts = q.data.split(":")
     sid = _val(int(parts[1]))
     cwd = _val(int(parts[2])) if len(parts) > 2 else ""
+    from_sessions = len(parts) > 3 and parts[3] == "s"
     try:
         sdk.delete_session(sid, directory=cwd or None)
     except Exception as exc:  # noqa: BLE001
@@ -693,8 +708,10 @@ async def cb_delsess(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         db.clear_active()
     sessions = _list_sessions(directory=cwd)
     if sessions:
-        await _show_session_picker(q, cwd, sessions)
+        await _show_session_picker(q, cwd, sessions,
+                                   mode="sessions" if from_sessions else "activate")
     else:
+        KNOWN_SID.pop(_skey(cwd, None), None)  # prevent stale resume of the deleted session
         db.set_active(cwd, None, cc.DEFAULT_MODEL)
         await q.edit_message_text(
             f"✅ Sesión borrada.\n"
@@ -758,7 +775,7 @@ async def cb_sesspick(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     cwd = _val(int(q.data.split(":")[1]))
     sessions = _list_sessions(directory=cwd)
     if sessions:
-        await _show_session_picker(q, cwd, sessions)
+        await _show_session_picker(q, cwd, sessions, mode="sessions")
     else:
         await q.edit_message_text(f"No quedan sesiones en `{Path(cwd).name}`.",
                                   parse_mode="Markdown")
@@ -1068,8 +1085,9 @@ async def cb_q_custom(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 # /send mode
 # --------------------------------------------------------------------------- #
 def _clear_send_mode() -> bool:
-    was = SEND_MODE["on"] or SEND_MODE["target"] is not None
-    SEND_MODE.update({"on": False, "target": None, "pending_text": None})
+    was = SEND_MODE["on"] or SEND_MODE["target"] is not None or SEND_MODE.get("oneshot", False)
+    SEND_MODE.update({"on": False, "target": None, "pending_text": None,
+                      "oneshot": False, "oneshot_pre": False})
     return was
 
 
@@ -1089,6 +1107,28 @@ async def cmd_multisesion(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         parse_mode="Markdown")
 
 
+@admin_only
+async def cmd_send(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """One-shot send: pick a session, dispatch one message, restore prior mode."""
+    SEND_MODE["oneshot"] = True
+    SEND_MODE["oneshot_pre"] = SEND_MODE["on"]
+    text_arg = " ".join(ctx.args) if ctx.args else None
+    if text_arg:
+        SEND_MODE["pending_text"] = text_arg
+    by_dir = _group_by_dir(_list_sessions())
+    if not by_dir:
+        SEND_MODE["oneshot"] = False
+        await update.message.reply_text("No hay sesiones todavía. Usa /open.")
+        return
+    btns = [[InlineKeyboardButton(f"📂 {Path(d).name} ({len(by_dir[d])})",
+                                  callback_data=f"sendpick:{_key(d)}")]
+            for d in sorted(by_dir)]
+    btns.append([InlineKeyboardButton("❌ Cancelar", callback_data="cancel:")])
+    await update.message.reply_text(
+        "📤 *Envío único* — elige proyecto:",
+        reply_markup=InlineKeyboardMarkup(btns), parse_mode="Markdown")
+
+
 async def cb_sendpick(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
@@ -1097,23 +1137,84 @@ async def cb_sendpick(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await _show_session_picker(q, cwd, sessions, mode="send")
 
 
+async def cb_sendback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Return to the project picker from the session picker (send mode)."""
+    q = update.callback_query
+    await q.answer()
+    by_dir = _group_by_dir(_list_sessions())
+    if not by_dir:
+        await q.edit_message_text("No hay sesiones todavía. Usa /open.")
+        return
+    btns = [[InlineKeyboardButton(f"📂 {Path(d).name} ({len(by_dir[d])})",
+                                  callback_data=f"sendpick:{_key(d)}")]
+            for d in sorted(by_dir)]
+    btns.append([InlineKeyboardButton("❌ Cancelar", callback_data="cancel:")])
+    await q.edit_message_text(
+        "📤 Elige proyecto:", reply_markup=InlineKeyboardMarkup(btns),
+        parse_mode="Markdown")
+
+
+async def cb_sessback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Return to the project picker from the session picker (/sessions mode)."""
+    q = update.callback_query
+    await q.answer()
+    by_dir = _group_by_dir(_list_sessions())
+    if not by_dir:
+        await q.edit_message_text("No hay sesiones todavía. Usa /open.")
+        return
+    active_dir = (db.get_active() or {}).get("directory", "")
+    btns = []
+    for d in sorted(by_dir):
+        mark = " ✅" if d == active_dir else ""
+        btns.append([InlineKeyboardButton(
+            f"📂 {Path(d).name}{mark} ({len(by_dir[d])})",
+            callback_data=f"sesspick:{_key(d)}")])
+    btns.append([InlineKeyboardButton("❌ Cancelar", callback_data="cancel:")])
+    await q.edit_message_text(
+        "¿De qué proyecto?", reply_markup=InlineKeyboardMarkup(btns),
+        parse_mode="Markdown")
+
+
 async def _send_to_target(q, cwd: str, skey: str, model: str, label: str):
     """Route one message to the chosen destination. The target is transient:
     after dispatch it is cleared so the next clean message asks again."""
+    oneshot = SEND_MODE.get("oneshot", False)
+    oneshot_pre = SEND_MODE.get("oneshot_pre", False)
+
     pending = SEND_MODE.pop("pending_text", None)
     SEND_MODE["pending_text"] = None
     if pending:
-        SEND_MODE["target"] = None  # one message per pick → re-ask next time
-        await q.edit_message_text(
-            f"📤 Enviando a {label}…\n_🔀 Sigues en multisesión · /exitmulti para salir_",
-            parse_mode="Markdown")
+        SEND_MODE["target"] = None
+        if oneshot:
+            SEND_MODE["oneshot"] = False
+            SEND_MODE["on"] = oneshot_pre  # restore prior mode
+            suffix = ("🔀 Sigues en multisesión · /exitmulti para salir"
+                      if oneshot_pre else "🔙 Volviendo a sesión normal")
+        else:
+            suffix = "🔀 Sigues en multisesión · /exitmulti para salir"
+        try:
+            await q.edit_message_text(
+                f"📤 Enviando a {label}…\n_{suffix}_", parse_mode="Markdown")
+        except BadRequest:
+            await q.edit_message_text(f"📤 Enviando…")
         await _dispatch(cwd, skey, model, pending)
     else:
-        # /send invoked without text yet: hold this destination for the very
-        # next message only (handle_text clears it once that message is sent).
-        SEND_MODE["target"] = {"skey": skey, "directory": cwd, "model": model}
-        await q.edit_message_text(
-            f"📤 Destino: {label}\n🧩 `{model}`\nEscribe el mensaje.", parse_mode="Markdown")
+        # No text yet — hold destination; handle_text dispatches on next message.
+        target = {"skey": skey, "directory": cwd, "model": model}
+        if oneshot:
+            target["oneshot_pre"] = oneshot_pre  # carry flag for handle_text
+            SEND_MODE["oneshot"] = False          # flag consumed, info in target
+        SEND_MODE["target"] = target
+        if oneshot:
+            suffix = ("🔀 Multisesión activa" if oneshot_pre else "🔙 Vuelve a normal tras envío")
+        else:
+            suffix = "🔀 Sigues en multisesión"
+        try:
+            await q.edit_message_text(
+                f"📤 Destino: {label}\n🧩 `{model}`\nEscribe el mensaje.\n_{suffix}_",
+                parse_mode="Markdown")
+        except BadRequest:
+            await q.edit_message_text(f"📤 Destino seleccionado. Escribe el mensaje.")
 
 
 async def cb_sendsess(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -1177,11 +1278,26 @@ async def cb_senddel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 @admin_only
 async def cmd_exitmulti(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if _clear_send_mode():
-        await update.message.reply_text("✅ Modo multisesión desactivado. "
-                                        "Vuelves a tu sesión activa.")
-    else:
+    if not _clear_send_mode():
         await update.message.reply_text("No estabas en modo multisesión.")
+        return
+    active = db.get_active()
+    if active and active.get("directory"):
+        sid = active.get("claude_session_id")
+        cwd_name = Path(active["directory"]).name
+        model = active.get("model") or cc.DEFAULT_MODEL
+        label = ""
+        if sid:
+            s = _find_session(sid, active["directory"])
+            if s:
+                label = f"\n💬 {_session_label(s).replace('`', chr(39))[:40]}"
+        await update.message.reply_text(
+            f"✅ Multisesión desactivada.\n"
+            f"📂 `{cwd_name}` · 🧩 `{model}`{label}",
+            parse_mode="Markdown")
+    else:
+        await update.message.reply_text(
+            "✅ Multisesión desactivada. Sin sesión activa — usa /open.")
 
 
 # --------------------------------------------------------------------------- #
@@ -1304,7 +1420,9 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     elif SEND_MODE["target"]:
         t = SEND_MODE["target"]
         directory, skey, model = t["directory"], t["skey"], t["model"]
-        SEND_MODE["target"] = None  # transient: next clean message re-asks
+        SEND_MODE["target"] = None
+        if "oneshot_pre" in t:
+            SEND_MODE["on"] = t["oneshot_pre"]  # restore mode after one-shot send
     else:
         active = db.get_active()
         if not active or not active.get("directory"):
@@ -1329,6 +1447,7 @@ HELP = (
     "/rename — renombrar la sesión activa (`/rename mi nombre`)\n"
     "/btw — pregunta rápida sobre la sesión, sin tocar su historial\n"
     "/permisos — modo de permisos\n"
+    "/send — envío único a sesión específica (un tiro)\n"
     "/multisesion — pregunta destino en cada mensaje\n"
     "/exitmulti — salir de multisesión\n"
     "/close — borrar sesiones de un proyecto\n"
@@ -1411,6 +1530,7 @@ def main():
     app.add_handler(CommandHandler("rename", cmd_rename))
     app.add_handler(CommandHandler("btw", cmd_btw))
     app.add_handler(CommandHandler("permisos", cmd_permisos))
+    app.add_handler(CommandHandler("send", cmd_send))
     app.add_handler(CommandHandler("multisesion", cmd_multisesion))
     app.add_handler(CommandHandler("exitmulti", cmd_exitmulti))
     app.add_handler(CommandHandler("esc", cmd_esc))
@@ -1430,6 +1550,8 @@ def main():
     app.add_handler(CallbackQueryHandler(cb_q_answer, pattern=r"^qa:"))
     app.add_handler(CallbackQueryHandler(cb_q_custom, pattern=r"^qc:"))
     app.add_handler(CallbackQueryHandler(cb_sendpick, pattern=r"^sendpick:"))
+    app.add_handler(CallbackQueryHandler(cb_sendback, pattern=r"^sendback:"))
+    app.add_handler(CallbackQueryHandler(cb_sessback, pattern=r"^sessback:"))
     app.add_handler(CallbackQueryHandler(cb_sendsess, pattern=r"^sendsess:"))
     app.add_handler(CallbackQueryHandler(cb_sendnew, pattern=r"^sendnew:"))
     app.add_handler(CallbackQueryHandler(cb_sendmodel, pattern=r"^sendmodel:"))
@@ -1451,6 +1573,7 @@ def main():
             BotCommand("rename", "Renombrar sesión activa"),
             BotCommand("btw", "Pregunta rápida (no afecta historial)"),
             BotCommand("permisos", "Modo de permisos"),
+            BotCommand("send", "Envío único a sesión específica"),
             BotCommand("multisesion", "Preguntar destino en cada mensaje"),
             BotCommand("exitmulti", "Salir de multisesión"),
             BotCommand("close", "Cerrar proyecto"),
