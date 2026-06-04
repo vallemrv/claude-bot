@@ -131,8 +131,7 @@ def _find_session(sid: str, cwd: str):
 
 
 def _context_bar(file_size: int) -> str:
-    """Rough context-usage indicator from conversation JSONL file size.
-    Heuristic: ~1 token per 6 bytes (JSON overhead); 200K window for all models."""
+    """Rough context-usage indicator from conversation JSONL file size."""
     est = file_size // 6
     pct = min(99, est * 100 // 200_000)
     icon = "🟢" if pct < 40 else ("🟡" if pct < 70 else ("🟠" if pct < 90 else "🔴"))
@@ -140,6 +139,13 @@ def _context_bar(file_size: int) -> str:
     size_str = f"{kb:.0f} KB" if kb < 1024 else f"{kb / 1024:.1f} MB"
     tip = " — considera sesión nueva" if pct >= 80 else ""
     return f"{icon} ctx ~{pct}% ({size_str}){tip}"
+
+
+def _ctx_pct(tokens_input: int) -> tuple[str, int]:
+    """Returns (inline indicator, pct) from real input token count. 200K window."""
+    pct = min(99, tokens_input * 100 // 200_000)
+    icon = "🟢" if pct < 40 else ("🟡" if pct < 70 else ("🟠" if pct < 90 else "🔴"))
+    return f"{icon} ctx {pct}%", pct
 
 
 def _session_card(s, meta: dict | None, cwd: str) -> str:
@@ -219,10 +225,14 @@ def _build_status_text(st: dict) -> str:
     model = st.get("model") or "?"
     elapsed = _format_elapsed(time.time() - st.get("start_time", time.time()))
 
+    sess_label = (st.get("session_label") or "").replace("`", "'").replace("*", "·")
+    label_line = f"💬 _{sess_label[:50]}_" if sess_label else ""
     lines = [
         f"{icon} *{labels.get(state, state.upper())}* | 📂 `{cwd_name}`",
         f"🧩 `{model}` | ⏱ `{elapsed}`",
     ]
+    if label_line:
+        lines.append(label_line)
     files = st.get("files_edited", set())
     if files:
         fs = ", ".join(f"`{f}`" for f in list(files)[:4])
@@ -238,9 +248,10 @@ def _build_status_text(st: dict) -> str:
     if state == "thinking" and st.get("reasoning_text"):
         snip = st["reasoning_text"][-200:].replace("`", "'").replace("*", "")
         lines.append(f"💭 _{snip}_")
-    toks = st.get("tokens_input", 0) + st.get("tokens_output", 0)
-    if toks:
-        lines.append(f"🔢 `{toks}` tok")
+    tok_in = st.get("tokens_input", 0)
+    if tok_in:
+        ctx_str, _ = _ctx_pct(tok_in)
+        lines.append(ctx_str)
     lines.append("\n_Pulsa_ /esc _para cancelar_")
     return "\n".join(lines)
 
@@ -277,9 +288,11 @@ def _ensure_heartbeat():
                                     first=STATUS_INTERVAL, name="hb")
 
 
-def _start_status(skey: str, directory: str, msg_id: int, model: str):
+def _start_status(skey: str, directory: str, msg_id: int, model: str,
+                  session_label: str | None = None):
     STATUSES[skey] = {
         "msg_id": msg_id, "directory": directory, "model": model,
+        "session_label": session_label,
         "state": "pending", "tool": None, "tools_seen": [], "files_edited": set(),
         "reasoning_text": None, "start_time": time.time(),
         "last_update_time": time.time(), "tokens_input": 0, "tokens_output": 0,
@@ -304,12 +317,18 @@ async def _send_reply(skey: str, directory: str, st: dict, final: dict | None):
         meta = db.get_session_meta(session_id)
         session_title = (meta or {}).get("title")
     
+    tok_in = st.get("tokens_input", 0)
     header = f"✅ `{cwd_name}` | 🧩 `{model}` | ⏱ `{elapsed}`"
-    if cost:
-        header += f" | 💲`{cost:.4f}`"
+    if tok_in:
+        ctx_str, ctx_pct = _ctx_pct(tok_in)
+        header += f" | {ctx_str}"
+    else:
+        ctx_pct = 0
     if session_title:
         truncated_title = session_title[:25] + ("..." if len(session_title) > 25 else "")
         header += f"\n📌 `{truncated_title}`"
+    if ctx_pct >= 80:
+        header += "\n⚠️ _Contexto casi lleno — considera abrir una sesión nueva_"
     if files:
         names = list(files)[:3]
         header += " 📝 " + ", ".join(f"`{f}`" for f in names)
@@ -395,6 +414,8 @@ async def _run_task(skey: str, directory: str, prompt: str,
                 sid = ev["session_id"]
                 KNOWN_SID[skey] = sid
                 db.remember_session(sid, directory, model, title)
+                if st and not st.get("session_label"):
+                    st["session_label"] = title
                 active = db.get_active()
                 if active and active.get("directory") == directory \
                         and not active.get("claude_session_id"):
@@ -463,11 +484,16 @@ async def _dispatch(directory: str, skey: str, model: str, text: str):
         parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup([[
             InlineKeyboardButton("❌ Cancelar", callback_data="abort:")]]))
-    _start_status(skey, directory, sent.message_id, model)
+    resume_sid = _resume_for(skey)
+    sess_label = None
+    if resume_sid:
+        s = _find_session(resume_sid, directory)
+        if s:
+            sess_label = _session_label(s)
+    _start_status(skey, directory, sent.message_id, model, sess_label)
     _track_msg(sent.message_id, skey, directory)
     RUNNING[skey] = {"client": None, "directory": directory}
 
-    resume_sid = _resume_for(skey)
     task = asyncio.create_task(_run_task(skey, directory, text, resume_sid, model))
     RUNNING[skey]["task"] = task
 
@@ -562,14 +588,21 @@ async def _show_session_picker(q, cwd: str, sessions: list, mode: str = "activat
         new_cb = f"newsess:{pk}"
         cur_sid = (db.get_active() or {}).get("claude_session_id")
         title = f"📂 `{Path(cwd).name}` — {len(sessions)} sesión(es)"
+        if cur_sid:
+            active_s = _find_session(cur_sid, cwd)
+            if active_s:
+                active_label = _session_label(active_s).replace("`", "'")[:50]
+                title += f"\n✅ {active_label}"
         sel = lambda sid: f"actsess:{_key(sid)}:{pk}"
         dele = lambda sid: f"delsess:{_key(sid)}:{pk}"
     btns = [[InlineKeyboardButton("➕ Nueva sesión", callback_data=new_cb)]]
     for s in sessions[:10]:
         sid = s.session_id
-        mark = " ✅" if sid == cur_sid else ""
+        is_active = sid == cur_sid
+        prefix = "✅ " if is_active else ""
+        label = f"{prefix}{_session_label(s)[:26 if is_active else 28]}"
         btns.append([
-            InlineKeyboardButton(f"{_session_label(s)[:28]}{mark}", callback_data=sel(sid)),
+            InlineKeyboardButton(label, callback_data=sel(sid)),
             InlineKeyboardButton("🗑", callback_data=dele(sid)),
         ])
     btns.append([InlineKeyboardButton("❌ Cancelar", callback_data="cancel:")])
@@ -691,7 +724,17 @@ async def cmd_sessions(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not by_dir:
         await update.message.reply_text("No hay sesiones todavía. Usa /open.")
         return
-    active_dir = (db.get_active() or {}).get("directory", "")
+    active = db.get_active() or {}
+    active_dir = active.get("directory", "")
+    active_sid = active.get("claude_session_id", "")
+
+    header = ""
+    if active_dir and active_sid:
+        s = _find_session(active_sid, active_dir)
+        label = _session_label(s).replace("`", "'")[:40] if s else active_sid[:8]
+        dir_name = Path(active_dir).name.replace("`", "'")
+        header = f"✅ Activa: `{dir_name}` › {label}\n\n"
+
     btns = []
     for d in sorted(by_dir):
         mark = " ✅" if d == active_dir else ""
@@ -699,8 +742,10 @@ async def cmd_sessions(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             f"📂 {Path(d).name}{mark} ({len(by_dir[d])})",
             callback_data=f"sesspick:{_key(d)}")])
     btns.append([InlineKeyboardButton("❌ Cancelar", callback_data="cancel:")])
-    await update.message.reply_text("¿De qué proyecto?",
-                                    reply_markup=InlineKeyboardMarkup(btns))
+    await update.message.reply_text(
+        f"{header}¿De qué proyecto?",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(btns))
 
 
 async def cb_sesspick(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
