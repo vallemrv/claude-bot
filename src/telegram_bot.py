@@ -651,6 +651,7 @@ async def cb_setmodel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
     cwd = _val(pk)
+    KNOWN_SID.pop(_skey(cwd, None), None)  # force truly new session, not a resume
     db.set_active(cwd, None, model)  # new session, materializes on first prompt
     await q.edit_message_text(
         f"✅ Sesión nueva en `{Path(cwd).name}`\n🧩 `{model}`\n\nEnvía tu primer prompt.",
@@ -1150,7 +1151,9 @@ async def cb_sendmodel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     parts = q.data.split(":")
     cwd = _val(int(parts[1]))
     model = _val(int(parts[2]))
-    await _send_to_target(q, cwd, _skey(cwd, None), model,
+    new_skey = _skey(cwd, None)
+    KNOWN_SID.pop(new_skey, None)  # force truly new session, not a resume
+    await _send_to_target(q, cwd, new_skey, model,
                           f"nueva sesión en `{Path(cwd).name}`")
 
 
