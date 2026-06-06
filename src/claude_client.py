@@ -38,9 +38,40 @@ logger = logging.getLogger(__name__)
 # Tools that edit files — used to surface "files edited" in the live status.
 EDIT_TOOLS = {"Write", "Edit", "MultiEdit", "NotebookEdit"}
 
-# Claude model aliases offered by /models
-MODELS = ["opus", "sonnet", "haiku"]
+# Claude model aliases offered by /models. "opus-1m" is the 1M-context Opus
+# (Claude Code's "Opus (1M context)"): the CLI wants the alias `opus[1m]`, so
+# _cli_model() translates it. Keeping a bot-side alias without the brackets
+# avoids `[1m]` ending up in callback_data / DB / labels unescaped.
+MODELS = ["opus", "opus-1m", "sonnet", "haiku"]
 DEFAULT_MODEL = "sonnet"
+
+# What to actually pass to `claude --model` for each bot alias.
+_MODEL_CLI = {"opus-1m": "opus[1m]"}
+
+# Context window (input tokens) per model — drives the ctx% indicator. The 1M
+# Opus has a 1,000,000-token window; everything else is the standard 200K.
+DEFAULT_CONTEXT_WINDOW = 200_000
+CONTEXT_WINDOWS = {"opus-1m": 1_000_000}
+
+# Human label for the picker buttons.
+MODEL_LABELS = {
+    "opus": "Opus (200K)",
+    "opus-1m": "Opus 1M",
+    "sonnet": "Sonnet",
+    "haiku": "Haiku",
+}
+
+
+def cli_model(model: str | None) -> str | None:
+    """Translate a bot model alias to the identifier the CLI expects."""
+    if not model:
+        return model
+    return _MODEL_CLI.get(model, model)
+
+
+def context_window(model: str | None) -> int:
+    """Input-token context window for a model alias (defaults to 200K)."""
+    return CONTEXT_WINDOWS.get(model or "", DEFAULT_CONTEXT_WINDOW)
 
 
 # --------------------------------------------------------------------------- #
@@ -161,7 +192,7 @@ async def run(prompt: str, cwd: str, model: str | None, resume_session_id: str |
         setting_sources=["user", "project", "local"],
     )
     if model:
-        kwargs["model"] = model
+        kwargs["model"] = cli_model(model)
     if resume_session_id:
         kwargs["resume"] = resume_session_id
     if mcp_server is not None:
@@ -233,7 +264,7 @@ async def ask_side(prompt: str, cwd: str, model: str | None,
         },
     )
     if model:
-        kwargs["model"] = model
+        kwargs["model"] = cli_model(model)
     if resume_session_id:
         kwargs["resume"] = resume_session_id
         kwargs["fork_session"] = True

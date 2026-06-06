@@ -15,6 +15,7 @@ import time
 import shutil
 import asyncio
 import logging
+import contextvars
 from pathlib import Path
 from collections import deque
 
@@ -67,6 +68,11 @@ PENDING_Q: dict = {}       # qid -> {"future", "options": [str]}
 SEND_MODE = {"on": False, "target": None, "pending_text": None,
              "oneshot": False, "oneshot_pre": False}
 MKDIR_PENDING: dict = {}   # {"path","msg_id"}
+
+# Per-task context (cwd, sid, model) propagated to the permission/question
+# bridges. A ContextVar isolates this per asyncio.Task, so concurrent sessions
+# don't mix up which project a permission/question belongs to.
+CURRENT_CTX: contextvars.ContextVar = contextvars.ContextVar("current_ctx", default=None)
 
 STATUS_INTERVAL = 10
 STATUS_THROTTLE = 3
@@ -167,22 +173,33 @@ def _find_session(sid: str, cwd: str):
     return None
 
 
-def _context_bar(file_size: int) -> str:
-    """Rough context-usage indicator from conversation JSONL file size."""
+def _context_bar(file_size: int, model: str | None = None) -> str:
+    """Rough context-usage indicator from conversation JSONL file size.
+    Window depends on the model (1M for opus-1m, else 200K)."""
+    window = cc.context_window(model)
     est = file_size // 6
-    pct = min(99, est * 100 // 200_000)
+    pct = min(99, est * 100 // window)
     icon = "🟢" if pct < 40 else ("🟡" if pct < 70 else ("🟠" if pct < 90 else "🔴"))
     kb = file_size / 1024
     size_str = f"{kb:.0f} KB" if kb < 1024 else f"{kb / 1024:.1f} MB"
     tip = " — considera sesión nueva" if pct >= 80 else ""
-    return f"{icon} ctx ~{pct}% ({size_str}){tip}"
+    win_tag = " /1M" if window >= 1_000_000 else ""
+    return f"{icon} ctx ~{pct}%{win_tag} ({size_str}){tip}"
 
 
-def _ctx_pct(tokens_input: int) -> tuple[str, int]:
-    """Returns (inline indicator, pct) from real input token count. 200K window."""
-    pct = min(99, tokens_input * 100 // 200_000)
+def _ctx_pct(tokens_input: int, model: str | None = None) -> tuple[str, int]:
+    """Returns (inline indicator, pct) from real input token count.
+    Window depends on the model (1M for opus-1m, else 200K)."""
+    window = cc.context_window(model)
+    pct = min(99, tokens_input * 100 // window)
     icon = "🟢" if pct < 40 else ("🟡" if pct < 70 else ("🟠" if pct < 90 else "🔴"))
-    return f"{icon} ctx {pct}%", pct
+    win_tag = " /1M" if window >= 1_000_000 else ""
+    return f"{icon} ctx {pct}%{win_tag}", pct
+
+
+def _model_label(model: str) -> str:
+    """Human-friendly label for a model alias in picker buttons."""
+    return cc.MODEL_LABELS.get(model, model)
 
 
 def _session_card(s, meta: dict | None, cwd: str) -> str:
@@ -215,8 +232,46 @@ def _session_card(s, meta: dict | None, cwd: str) -> str:
         f"💬 {title}",
     ]
     if file_size:
-        lines.append(_context_bar(file_size))
+        lines.append(_context_bar(file_size, model))
     return "\n".join(lines)
+
+
+def _active_card(cwd: str, sid: str | None, model: str | None,
+                 header: str = "🔄 *Sesión activa*") -> str:
+    """Uniform 'active session' block used whenever the active pointer changes.
+    Resolves the live SDK session (for branch / age / context bar / title) and
+    falls back gracefully to project + model + stored title when the session
+    object isn't available yet (e.g. a new session not materialized, or list
+    failed). `header` lets callers say e.g. '🔄 Sesión activa' vs '✅ Nueva sesión'."""
+    meta = db.get_session_meta(sid) if sid else None
+    model = model or (meta or {}).get("model") or cc.DEFAULT_MODEL
+    s = _find_session(sid, cwd) if sid else None
+    if s:
+        return f"{header}\n{_session_card(s, meta, cwd)}"
+    # Fallback: no SDK object (new/unmaterialized session or list error).
+    title = (meta or {}).get("title")
+    lines = [header, f"📂 `{Path(cwd).name or '?'}`", f"🧩 `{model}`"]
+    if title:
+        lines.append(f"💬 {title.replace('`', chr(39))[:50]}")
+    elif not sid:
+        lines.append("🆕 _sesión nueva — envía tu primer prompt_")
+    return "\n".join(lines)
+
+
+def _active_line(cwd: str, sid: str | None, model: str | None) -> str:
+    """One-line active-session summary for secondary notices (queue, cancel).
+    Compact: project · model · short title."""
+    meta = db.get_session_meta(sid) if sid else None
+    model = model or (meta or {}).get("model") or cc.DEFAULT_MODEL
+    parts = [f"📂 `{Path(cwd).name or '?'}`", f"🧩 `{model}`"]
+    title = (meta or {}).get("title")
+    if not title and sid:
+        s = _find_session(sid, cwd)
+        if s:
+            title = _session_label(s)
+    if title:
+        parts.append(f"💬 _{title.replace('`', chr(39))[:35]}_")
+    return " · ".join(parts)
 
 
 def _list_sessions(directory: str | None = None) -> list:
@@ -326,7 +381,7 @@ def _build_status_text(st: dict) -> str:
         lines.append(f"💭 _{snip}_")
     tok_in = st.get("tokens_input", 0)
     if tok_in:
-        ctx_str, _ = _ctx_pct(tok_in)
+        ctx_str, _ = _ctx_pct(tok_in, st.get("model"))
         lines.append(ctx_str)
     lines.append("\n_Pulsa_ /esc _para cancelar_")
     return "\n".join(lines)
@@ -409,7 +464,7 @@ async def _send_reply(skey: str, directory: str, st: dict, final: dict | None,
     tok_in = st.get("tokens_input", 0)
     header = f"{icon} `{cwd_name}` | 🧩 `{model}` | ⏱ `{elapsed}`"
     if tok_in:
-        ctx_str, ctx_pct = _ctx_pct(tok_in)
+        ctx_str, ctx_pct = _ctx_pct(tok_in, model)
         header += f" | {ctx_str}"
     else:
         ctx_pct = 0
@@ -528,6 +583,9 @@ async def _run_task(skey: str, directory: str, prompt: str,
     error_msg = None
     title = prompt.strip().replace("\n", " ")[:40]
     can_use_tool = _can_use_tool if PERMISSION_MODE != "bypassPermissions" else None
+    # Stamp this task's context so permission/question prompts can name the
+    # project + session they belong to (matters in multisession).
+    CURRENT_CTX.set({"directory": directory, "skey": skey, "model": model})
 
     async def _consume():
         nonlocal final, error_msg
@@ -609,10 +667,14 @@ async def _dispatch(directory: str, skey: str, model: str, text: str):
         QUEUES.setdefault(skey, deque()).append(
             {"text": text, "directory": directory, "model": model})
         pos = len(QUEUES[skey])
+        sid = _resume_for(skey)
+        line = _active_line(directory, sid, model)
         await _safe_send(
-            f"⏳ `{Path(directory).name}` ocupado. En cola (posición {pos}).",
+            f"⏳ *Ocupado* — en cola (posición {pos})\n{line}\n"
+            f"📨 _«{text.strip()[:60]}»_",
             parse_mode="Markdown",
-            plain_fallback=f"⏳ {Path(directory).name} ocupado. En cola (posición {pos}).")
+            plain_fallback=f"⏳ Ocupado — en cola (posición {pos}). "
+                           f"{Path(directory).name} / {model}")
         return
 
     # Reserve the slot synchronously before any await to prevent a second
@@ -802,7 +864,7 @@ async def _show_session_picker(q, cwd: str, sessions: list, mode: str = "activat
 
 async def _show_model_picker(q, cwd: str | None):
     pk = _key(cwd) if cwd else -1
-    btns = [[InlineKeyboardButton(("🧩 " + m), callback_data=f"setmodel:{pk}:{_key(m)}")]
+    btns = [[InlineKeyboardButton("🧩 " + _model_label(m), callback_data=f"setmodel:{pk}:{_key(m)}")]
             for m in cc.MODELS]
     btns.append([InlineKeyboardButton("❌ Cancelar", callback_data="cancel:")])
     header = f"📂 `{Path(cwd).name}`\n" if cwd else ""
@@ -837,13 +899,17 @@ async def cb_setmodel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if pk == -1:  # /models mode → change active session model
         active = db.get_active()
         if not active:
-            await q.edit_message_text("⚠️ No hay sesión activa.")
+            await q.edit_message_text("⚠️ No hay sesión activa. Usa /open.")
             return
-        db.set_active(active["directory"], active.get("claude_session_id"), model)
-        if active.get("claude_session_id"):
-            db.set_session_model(active["claude_session_id"], model)
-        await q.edit_message_text(f"✅ Modelo `{model}` aplicado a la sesión activa.",
-                                  parse_mode="Markdown")
+        cwd = active["directory"]
+        sid = active.get("claude_session_id")
+        db.set_active(cwd, sid, model)
+        if sid:
+            db.set_session_model(sid, model)
+        # Show the whole session so it's clear *which* session got the new model.
+        await q.edit_message_text(
+            f"✅ *Modelo cambiado a* `{model}`\n{_active_card(cwd, sid, model, header='📍 En esta sesión:')}",
+            parse_mode="Markdown")
         return
 
     cwd = _val(pk)
@@ -853,7 +919,7 @@ async def cb_setmodel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     KNOWN_SID.pop(_skey(cwd, None), None)  # force truly new session, not a resume
     db.set_active(cwd, None, model)  # new session, materializes on first prompt
     await q.edit_message_text(
-        f"✅ Sesión nueva en `{Path(cwd).name}`\n🧩 `{model}`\n\nEnvía tu primer prompt.",
+        _active_card(cwd, None, model, header="✅ *Nueva sesión activa*"),
         parse_mode="Markdown")
 
 
@@ -872,13 +938,9 @@ async def cb_actsess(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     meta = db.get_session_meta(sid)
     model = (meta or {}).get("model") or cc.DEFAULT_MODEL
     db.set_active(cwd, sid, model)
-    s = _find_session(sid, cwd)
-    if s:
-        await q.edit_message_text(f"✅ *Sesión activa*\n{_session_card(s, meta, cwd)}",
-                                  parse_mode="Markdown")
-    else:
-        await q.edit_message_text(f"✅ Sesión activa\n📂 `{Path(cwd).name}`\n🧩 `{model}`",
-                                  parse_mode="Markdown")
+    await q.edit_message_text(
+        _active_card(cwd, sid, model, header="✅ *Sesión activa*"),
+        parse_mode="Markdown")
 
 
 async def cb_delsess(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -911,9 +973,9 @@ async def cb_delsess(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         KNOWN_SID.pop(_skey(cwd, None), None)  # prevent stale resume of the deleted session
         db.set_active(cwd, None, cc.DEFAULT_MODEL)
         await q.edit_message_text(
-            f"✅ Sesión borrada.\n"
-            f"📌 Nueva sesión creada automáticamente en `{Path(cwd).name}`\n"
-            f"🧩 `{cc.DEFAULT_MODEL}`",
+            "🗑️ *Sesión borrada* — no quedaban más en el proyecto.\n"
+            + _active_card(cwd, None, cc.DEFAULT_MODEL,
+                           header="🔄 *Nueva sesión activa (automática)*"),
             parse_mode="Markdown")
 
 
@@ -1033,10 +1095,13 @@ async def cb_closedir(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         except Exception:  # noqa: BLE001
             pass
     active = db.get_active()
-    if active and active.get("directory") == cwd:
+    cleared_active = bool(active and active.get("directory") == cwd)
+    if cleared_active:
         db.clear_active()
-    await q.edit_message_text(f"✅ `{Path(cwd).name}` cerrado — {deleted} sesión(es) borradas.",
-                              parse_mode="Markdown")
+    msg = f"✅ `{Path(cwd).name}` cerrado — {deleted} sesión(es) borradas."
+    if cleared_active:
+        msg += "\n⚠️ _Era tu proyecto activo: ya no hay sesión activa._ Usa /open."
+    await q.edit_message_text(msg, parse_mode="Markdown")
 
 
 # --------------------------------------------------------------------------- #
@@ -1049,11 +1114,11 @@ async def cmd_models(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⚠️ No hay sesión activa. Usa /open.")
         return
     cur = active.get("model") or cc.DEFAULT_MODEL
-    btns = [[InlineKeyboardButton(("✅ " if m == cur else "🧩 ") + m,
+    btns = [[InlineKeyboardButton(("✅ " if m == cur else "🧩 ") + _model_label(m),
                                   callback_data=f"setmodel:-1:{_key(m)}")]
             for m in cc.MODELS]
     btns.append([InlineKeyboardButton("❌ Cancelar", callback_data="cancel:")])
-    await update.message.reply_text(f"🧩 Modelo actual: `{cur}`\nElige:",
+    await update.message.reply_text(f"🧩 Modelo actual: `{_model_label(cur)}`\nElige:",
                                     reply_markup=InlineKeyboardMarkup(btns),
                                     parse_mode="Markdown")
 
@@ -1075,7 +1140,10 @@ async def cmd_rename(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     title = title[:60]
     db.set_session_title(sid, title)
-    await update.message.reply_text(f"✅ Sesión renombrada: `{title}`", parse_mode="Markdown")
+    cwd = active["directory"]
+    await update.message.reply_text(
+        f"✅ *Sesión renombrada:* `{title}`\n📂 `{Path(cwd).name}` · 🧩 `{active.get('model') or cc.DEFAULT_MODEL}`",
+        parse_mode="Markdown")
 
 
 @admin_only
@@ -1165,8 +1233,21 @@ async def cb_perm_mode(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await _expired(q)
         return
     PERMISSION_MODE = mode
-    await q.edit_message_text(f"🔐 Modo de permisos: `{PERMISSION_MODE}`",
-                              parse_mode="Markdown")
+    desc = {
+        "bypassPermissions": "hace todo sin preguntar",
+        "acceptEdits": "edita sin preguntar, pregunta comandos",
+        "default": "pregunta (botones) en cada acción",
+        "plan": "solo planifica, no toca nada",
+    }.get(mode, "")
+    text = (f"🔐 *Modo de permisos:* `{PERMISSION_MODE}`\n"
+            f"_{desc}_\n"
+            f"🌍 _Aplica a todas las sesiones (global)._")
+    active = db.get_active()
+    if active and active.get("directory"):
+        text += "\n\n" + _active_line(active["directory"],
+                                       active.get("claude_session_id"),
+                                       active.get("model"))
+    await q.edit_message_text(text, parse_mode="Markdown")
 
 
 # --------------------------------------------------------------------------- #
@@ -1189,11 +1270,13 @@ async def _abort(skey: str) -> str:
     entry = RUNNING.get(skey)
     if not entry:
         return "⚠️ No hay tarea en curso."
+    directory = entry.get("directory", "")
     await _interrupt_client(skey)
     task = entry.get("task")
     if task and not task.done():
         task.cancel()
-    return "🛑 Tarea cancelada."
+    line = _active_line(directory, _resume_for(skey), None) if directory else ""
+    return f"🛑 *Tarea cancelada.*\n{line}" if line else "🛑 Tarea cancelada."
 
 
 @admin_only
@@ -1203,7 +1286,7 @@ async def cmd_esc(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⚠️ No hay sesión activa.")
         return
     skey = _skey(active["directory"], active.get("claude_session_id"))
-    await update.message.reply_text(await _abort(skey))
+    await update.message.reply_text(await _abort(skey), parse_mode="Markdown")
 
 
 async def cb_abort(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -1216,7 +1299,7 @@ async def cb_abort(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         skey = _skey(active["directory"], active.get("claude_session_id")) if active else None
     msg = await _abort(skey) if skey else "⚠️ No hay tarea en curso."
     try:
-        await q.edit_message_text(msg)
+        await q.edit_message_text(msg, parse_mode="Markdown")
     except BadRequest:
         await APP.bot.send_message(ADMIN_ID, msg)
 
@@ -1224,6 +1307,16 @@ async def cb_abort(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 # --------------------------------------------------------------------------- #
 # Permission + question bridges (used in non-bypass modes / ask_user tool)
 # --------------------------------------------------------------------------- #
+def _ctx_line() -> str:
+    """Compact 'which session is asking' line for permission/question prompts,
+    read from the current task's ContextVar. Empty if unknown."""
+    ctx = CURRENT_CTX.get()
+    if not ctx or not ctx.get("directory"):
+        return ""
+    return _active_line(ctx["directory"], _resume_for(ctx.get("skey", "")),
+                        ctx.get("model"))
+
+
 async def _can_use_tool(tool_name: str, input_data: dict, context):
     loop = asyncio.get_event_loop()
     fut = loop.create_future()
@@ -1234,10 +1327,12 @@ async def _can_use_tool(tool_name: str, input_data: dict, context):
         [InlineKeyboardButton("✅ Permitir", callback_data=f"pa:{qid}:1"),
          InlineKeyboardButton("❌ Denegar", callback_data=f"pa:{qid}:0")],
     ]
-    await APP.bot.send_message(
-        ADMIN_ID,
-        f"🔐 *Permiso*\nClaude quiere usar `{tool_name}`\n`{preview}`",
-        parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(btns))
+    await _safe_send(
+        f"🔐 *Permiso* — {_ctx_line()}\n"
+        f"Claude quiere usar `{tool_name}`\n`{preview}`",
+        parse_mode="Markdown",
+        plain_fallback=f"🔐 Permiso: Claude quiere usar {tool_name}\n{preview}",
+        reply_markup=InlineKeyboardMarkup(btns))
     try:
         allow = await asyncio.wait_for(fut, timeout=600)
     except asyncio.TimeoutError:
@@ -1268,8 +1363,15 @@ async def _question_bridge(question: str, options: str) -> str:
     btns = [[InlineKeyboardButton(o[:60], callback_data=f"qa:{qid}:{i}")]
             for i, o in enumerate(opts)]
     btns.append([InlineKeyboardButton("✏️ Responder por texto", callback_data=f"qc:{qid}")])
-    await APP.bot.send_message(ADMIN_ID, f"❓ {question}",
-                              reply_markup=InlineKeyboardMarkup(btns))
+    # Plain-text context prefix (the question itself is sent as plain text to
+    # avoid markdown breakage), so you know which session is asking.
+    ctx = CURRENT_CTX.get()
+    prefix = ""
+    if ctx and ctx.get("directory"):
+        proj = Path(ctx["directory"]).name
+        prefix = f"❓ [{proj} · {ctx.get('model') or cc.DEFAULT_MODEL}]\n"
+    await _safe_send(f"{prefix}❓ {question}" if prefix else f"❓ {question}",
+                     parse_mode=None, reply_markup=InlineKeyboardMarkup(btns))
     try:
         return await asyncio.wait_for(fut, timeout=900)
     except asyncio.TimeoutError:
@@ -1468,7 +1570,7 @@ async def cb_sendnew(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not cwd or cwd == KEY_MISSING:
         await _expired(q)
         return
-    btns = [[InlineKeyboardButton("🧩 " + m, callback_data=f"sendmodel:{pk}:{_key(m)}")]
+    btns = [[InlineKeyboardButton("🧩 " + _model_label(m), callback_data=f"sendmodel:{pk}:{_key(m)}")]
             for m in cc.MODELS]
     btns.append([InlineKeyboardButton("❌ Cancelar", callback_data="cancel:")])
     await q.edit_message_text(
@@ -1526,17 +1628,10 @@ async def cmd_exitmulti(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     active = db.get_active()
     if active and active.get("directory"):
-        sid = active.get("claude_session_id")
-        cwd_name = Path(active["directory"]).name
-        model = active.get("model") or cc.DEFAULT_MODEL
-        label = ""
-        if sid:
-            s = _find_session(sid, active["directory"])
-            if s:
-                label = f"\n💬 {_session_label(s).replace('`', chr(39))[:40]}"
         await update.message.reply_text(
-            f"✅ Multisesión desactivada.\n"
-            f"📂 `{cwd_name}` · 🧩 `{model}`{label}",
+            "✅ *Multisesión desactivada.*\n"
+            + _active_card(active["directory"], active.get("claude_session_id"),
+                           active.get("model"), header="↩️ *Vuelves a tu sesión activa:*"),
             parse_mode="Markdown")
     else:
         await update.message.reply_text(
