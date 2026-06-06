@@ -46,11 +46,13 @@ Three layers, each requiring the others for context:
   generator yielding **normalized events** (`session`/`text`/`thinking`/`tool`/
   `usage`/`result`/`error`) that the bot renders. Also defines the `ask_user` MCP
   tool and `ask_side()` (see `/btw` below).
-- **`src/db.py`** — SQLite (`bot.db`). Stores **only** the active-session pointer and
-  per-session metadata (model, custom title). The real conversation history is
-  persisted on disk by Claude itself; session discovery uses the SDK's native
-  `list_sessions()` / `resume=` / `delete_session()`. Do not try to duplicate
-  conversation state here.
+- **`src/db.py`** — SQLite (`bot.db`). Stores the active-session pointer,
+  per-session metadata (model, custom title), a **persisted callback keystore**
+  (`keystore` table — so inline buttons survive restarts) and an **in-flight task
+  ledger** (`inflight` table — for orphan detection after a restart). The real
+  conversation history is persisted on disk by Claude itself; session discovery
+  uses the SDK's native `list_sessions()` / `resume=` / `delete_session()`. Do not
+  try to duplicate conversation state here. Connections use WAL + `busy_timeout`.
 
 ### Session model — the `skey` concept (central, easy to get wrong)
 
@@ -69,10 +71,17 @@ All runtime state is keyed by `skey`: `STATUSES` (live status), `RUNNING`
 
 `_dispatch()` reserves the `STATUSES[skey]` slot synchronously (before any await,
 to avoid double-dispatch races), posts a status message, then launches `_run_task`
-as an `asyncio.Task`. `_run_task` consumes `cc.run()` events, updates a live status
-message (throttled + a `job_queue` heartbeat), and on completion `_finish()` deletes
-the status, sends the final reply, and drains the queue. If a `skey` is already in
-`STATUSES`, new prompts are **queued**, not run concurrently.
+as an `asyncio.Task`. If posting the status fails, the slot is freed (so the session
+isn't wedged "busy"). `_run_task` consumes `cc.run()` events under an
+`asyncio.wait_for(TASK_TIMEOUT)` cap (a hung CLI is interrupted, not left forever),
+updates a live status message (throttled + a `job_queue` heartbeat), and on
+completion `_finish()` deletes the status, sends the final reply, and drains the
+queue. `_finish` runs under `asyncio.shield` inside the `finally`, so a cancellation
+(`/esc`) can't abort the queue drain. The reply header reflects the real outcome:
+`✅` success / `❌` error (`result.is_error` + `subtype`) / `🛑` cancelled. If a `skey`
+is already in `STATUSES`, new prompts are **queued**, not run concurrently. Each
+in-flight task is recorded in the `inflight` table; on startup `post_init` detects
+rows left by a crash/restart, deletes the orphaned status messages and warns the user.
 
 ### Message routing (`handle_text`)
 
@@ -84,7 +93,21 @@ session**. Replying to any bot message is how parallel conversations work.
 
 Telegram limits `callback_data` to 64 bytes. `_key(str)→int` / `_val(int)→str`
 (`KEYSTORE`) compress long values (paths, session ids, model names) into small ints
-embedded in callbacks like `actsess:{k}:{pk}`. Always round-trip through these.
+embedded in callbacks like `actsess:{k}:{pk}`. Always round-trip through these. The
+`KEYSTORE` is **persisted** (`keystore` table) and reloaded at startup so pre-restart
+buttons still resolve. `_val` returns the `KEY_MISSING` sentinel (not `""`) for an
+unknown int; destructive callbacks must guard on it (and on empty cwd/sid) and call
+`_expired(q)` instead of acting — otherwise a stale button could wipe unrelated
+sessions (`list_sessions("")` returns **all** projects) or clobber the active pointer.
+Use `_vals(*ints)` to resolve several at once (returns `None` if any is missing).
+
+### Robustness helpers
+
+- `_safe_send()` is the resilient sender: retries on `RetryAfter`/`NetworkError`,
+  falls back to plain text on `BadRequest`, and never raises (safe in `finally`).
+  Prefer it over `APP.bot.send_message` for user-facing replies/notices.
+- `on_error` is the global PTB error handler — nothing fails silently; the admin
+  gets a short summary so a stuck "loading" button always has a follow-up.
 
 ### Permission / question bridges
 

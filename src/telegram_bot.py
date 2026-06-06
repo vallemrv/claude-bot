@@ -72,6 +72,7 @@ STATUS_INTERVAL = 10
 STATUS_THROTTLE = 3
 MSG_TRACK_LIMIT = 200
 MD_FILE_THRESHOLD = 6000
+PENDING_FLOW_TTL = 300  # s — after this, a stale mkdir/question flow is ignored
 
 
 # --------------------------------------------------------------------------- #
@@ -90,13 +91,48 @@ def _key(value: str) -> int:
     for k, v in KEYSTORE.items():
         if v == value:
             return k
-    k = len(KEYSTORE)
+    k = (max(KEYSTORE) + 1) if KEYSTORE else 0
     KEYSTORE[k] = value
+    try:
+        db.keystore_put(k, value)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(f"keystore_put failed: {exc}")
     return k
 
 
+# Sentinel returned by _val for an int that isn't in the keystore (e.g. a
+# button from before a wipe). Distinct from "" so callbacks can detect a
+# stale/expired menu and tell the user to reopen it instead of acting on "".
+KEY_MISSING = "\x00__missing__"
+
+
 def _val(k: int) -> str:
-    return KEYSTORE.get(k, "")
+    return KEYSTORE.get(k, KEY_MISSING)
+
+
+def _vals(*ks: int) -> list[str] | None:
+    """Resolve several keystore ints at once. Returns None if ANY is missing
+    (stale callback), so callers can bail out with a single guard."""
+    out = []
+    for k in ks:
+        v = KEYSTORE.get(k, KEY_MISSING)
+        if v == KEY_MISSING:
+            return None
+        out.append(v)
+    return out
+
+
+async def _expired(q) -> None:
+    """Tell the user a button no longer resolves (keystore lost its value,
+    typically after a data wipe) and that they should reopen the menu."""
+    try:
+        await q.edit_message_text(
+            "⚠️ Este menú ha caducado (el bot perdió su contexto). "
+            "Vuelve a abrirlo con /open o el comando correspondiente.")
+    except BadRequest:
+        await APP.bot.send_message(
+            ADMIN_ID,
+            "⚠️ Ese botón ha caducado. Vuelve a abrir el menú con /open.")
 
 
 # --------------------------------------------------------------------------- #
@@ -200,6 +236,45 @@ async def _delete_msg(bot, msg_id: int):
         await bot.delete_message(chat_id=ADMIN_ID, message_id=msg_id)
     except Exception:  # noqa: BLE001
         pass
+
+
+async def _safe_send(text: str, parse_mode: str | None = "MarkdownV2",
+                     plain_fallback: str | None = None, **kwargs):
+    """Send a message to the admin resiliently:
+      - retries once on RetryAfter (flood control) and on transient NetworkError
+      - on BadRequest (bad markdown) falls back to plain text
+    Returns the sent Message, or None if it ultimately failed (always logged,
+    never raised, so callers in a finally block don't lose their flow)."""
+    for attempt in range(2):
+        try:
+            return await APP.bot.send_message(ADMIN_ID, text, parse_mode=parse_mode,
+                                              **kwargs)
+        except BadRequest:
+            if plain_fallback is not None:
+                try:
+                    return await APP.bot.send_message(ADMIN_ID, plain_fallback,
+                                                      **kwargs)
+                except Exception as exc:  # noqa: BLE001
+                    logger.error(f"_safe_send plain fallback failed: {exc}")
+                    return None
+            logger.error("_safe_send BadRequest with no plain fallback")
+            return None
+        except RetryAfter as e:
+            if attempt == 0:
+                await asyncio.sleep(float(getattr(e, "retry_after", 1)) + 0.5)
+                continue
+            logger.error("_safe_send giving up after RetryAfter")
+            return None
+        except NetworkError as e:
+            if attempt == 0:
+                await asyncio.sleep(1.0)
+                continue
+            logger.error(f"_safe_send giving up after NetworkError: {e}")
+            return None
+        except Exception as exc:  # noqa: BLE001
+            logger.error(f"_safe_send unexpected error: {exc}")
+            return None
+    return None
 
 
 def _track_msg(message_id: int, skey: str, directory: str):
@@ -307,26 +382,47 @@ def _start_status(skey: str, directory: str, msg_id: int, model: str,
 # --------------------------------------------------------------------------- #
 # Final reply
 # --------------------------------------------------------------------------- #
-async def _send_reply(skey: str, directory: str, st: dict, final: dict | None):
+async def _send_reply(skey: str, directory: str, st: dict, final: dict | None,
+                      cancelled: bool = False, error_msg: str | None = None):
     cwd_name = Path(directory).name or "?"
     model = st.get("model") or "?"
     elapsed = _format_elapsed(time.time() - st.get("start_time", time.time()))
     cost = (final or {}).get("cost", 0.0)
     files = st.get("files_edited", set())
 
+    # Outcome icon — never claim success when Claude errored or was cancelled.
+    is_error = bool((final or {}).get("is_error"))
+    subtype = (final or {}).get("subtype") or ""
+    if cancelled:
+        icon = "🛑"
+    elif is_error or error_msg:
+        icon = "❌"
+    else:
+        icon = "✅"
+
     session_id = _resume_for(skey)
     session_title = None
     if session_id:
         meta = db.get_session_meta(session_id)
         session_title = (meta or {}).get("title")
-    
+
     tok_in = st.get("tokens_input", 0)
-    header = f"✅ `{cwd_name}` | 🧩 `{model}` | ⏱ `{elapsed}`"
+    header = f"{icon} `{cwd_name}` | 🧩 `{model}` | ⏱ `{elapsed}`"
     if tok_in:
         ctx_str, ctx_pct = _ctx_pct(tok_in)
         header += f" | {ctx_str}"
     else:
         ctx_pct = 0
+    if cancelled:
+        header += "\n🛑 _Cancelado por ti_"
+    elif is_error:
+        # Surface the CLI's structured error reason (e.g. error_max_turns).
+        reason = {"error_max_turns": "límite de turnos alcanzado",
+                  "error_during_execution": "error durante la ejecución"}.get(
+                      subtype, subtype or "error")
+        header += f"\n❌ _Claude terminó con error: {reason}_"
+    elif error_msg:
+        header += f"\n❌ _{error_msg[:200]}_"
     if session_title:
         truncated_title = session_title[:25] + ("..." if len(session_title) > 25 else "")
         header += f"\n📌 `{truncated_title}`"
@@ -340,50 +436,74 @@ async def _send_reply(skey: str, directory: str, st: dict, final: dict | None):
 
     text = (final or {}).get("text", "") or ""
     if not text:
-        sent = await APP.bot.send_message(ADMIN_ID, f"{md2tgv2.convert(header)}\n_Listo\\._",
-                                          parse_mode="MarkdownV2")
-        _track_msg(sent.message_id, skey, directory)
+        # No body — still confirm the outcome so the user always knows what happened.
+        tail = "_Cancelado\\._" if cancelled else (
+            "_Terminó con error\\._" if (is_error or error_msg) else "_Listo\\._")
+        sent = await _safe_send(f"{md2tgv2.convert(header)}\n{tail}",
+                                plain_fallback=f"{header}\n(sin texto)")
+        if sent:
+            _track_msg(sent.message_id, skey, directory)
         return
 
     if len(text) > MD_FILE_THRESHOLD:
         import io
         f = io.BytesIO(text.encode("utf-8"))
         f.name = "respuesta.md"
-        try:
-            sent = await APP.bot.send_document(ADMIN_ID, document=f,
-                                               caption=md2tgv2.convert(header),
-                                               parse_mode="MarkdownV2")
-            _track_msg(sent.message_id, skey, directory)
-        except Exception as exc:  # noqa: BLE001
-            logger.error(f"send respuesta.md failed: {exc}")
+        for attempt in range(2):
+            try:
+                sent = await APP.bot.send_document(ADMIN_ID, document=f,
+                                                   caption=md2tgv2.convert(header),
+                                                   parse_mode="MarkdownV2")
+                _track_msg(sent.message_id, skey, directory)
+                return
+            except RetryAfter as e:
+                if attempt == 0:
+                    await asyncio.sleep(float(getattr(e, "retry_after", 1)) + 0.5)
+                    f.seek(0)
+                    continue
+                logger.error("send respuesta.md giving up after RetryAfter")
+            except Exception as exc:  # noqa: BLE001
+                logger.error(f"send respuesta.md failed: {exc}")
+                break
+        # Fallback: at least notify the user the body couldn't be delivered.
+        await _safe_send(
+            f"{md2tgv2.convert(header)}\n⚠️ _No se pudo enviar la respuesta completa "
+            f"\\(ver logs\\)\\._",
+            plain_fallback=f"{header}\n⚠️ No se pudo enviar la respuesta (ver logs).")
         return
 
     chunks = [text[i:i+3800] for i in range(0, len(text), 3800)]
     last = None
     for i, chunk in enumerate(chunks):
         body = (f"{md2tgv2.convert(header)}\n" if i == 0 else "") + md2tgv2.convert(chunk)
-        try:
-            last = await APP.bot.send_message(ADMIN_ID, body, parse_mode="MarkdownV2")
-        except BadRequest:
-            plain = (f"{header}\n" if i == 0 else "") + chunk
-            try:
-                last = await APP.bot.send_message(ADMIN_ID, plain)
-            except Exception as exc:  # noqa: BLE001
-                logger.error(f"send chunk failed: {exc}")
+        plain = (f"{header}\n" if i == 0 else "") + chunk
+        sent = await _safe_send(body, plain_fallback=plain)
+        if sent:
+            last = sent
     if last:
         _track_msg(last.message_id, skey, directory)
+    else:
+        # Every chunk failed to send → don't leave the user in the dark.
+        await _safe_send("⚠️ _No se pudo enviar la respuesta \\(ver logs\\)\\._",
+                         plain_fallback="⚠️ No se pudo enviar la respuesta (ver logs).")
 
 
-async def _finish(skey: str, directory: str, final: dict | None):
+async def _finish(skey: str, directory: str, final: dict | None,
+                  cancelled: bool = False, error_msg: str | None = None):
     st = STATUSES.pop(skey, None)
     RUNNING.pop(skey, None)
+    try:
+        db.inflight_remove(skey)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(f"inflight_remove failed: {exc}")
     if APP.job_queue and not STATUSES:
         for j in APP.job_queue.get_jobs_by_name("hb"):
             j.schedule_removal()
     if st and st.get("msg_id"):
         await _delete_msg(APP.bot, st["msg_id"])
     if st:
-        await _send_reply(skey, directory, st, final)
+        await _send_reply(skey, directory, st, final,
+                          cancelled=cancelled, error_msg=error_msg)
     await _drain_queue(skey, directory)
 
 
@@ -404,9 +524,13 @@ async def _run_task(skey: str, directory: str, prompt: str,
                     resume_sid: str | None, model: str):
     st = STATUSES.get(skey)
     final = None
+    cancelled = False
+    error_msg = None
     title = prompt.strip().replace("\n", " ")[:40]
     can_use_tool = _can_use_tool if PERMISSION_MODE != "bypassPermissions" else None
-    try:
+
+    async def _consume():
+        nonlocal final, error_msg
         async for ev in cc.run(prompt, directory, model, resume_sid,
                                PERMISSION_MODE, can_use_tool, MCP_SERVER):
             t = ev["type"]
@@ -453,15 +577,30 @@ async def _run_task(skey: str, directory: str, prompt: str,
                 if st:
                     st["cost"] = ev.get("cost", 0.0)
             elif t == "error":
-                await APP.bot.send_message(ADMIN_ID, f"❌ Error: {ev['message'][:1500]}")
+                error_msg = ev["message"]
+                await _safe_send(f"❌ Error: {ev['message'][:1500]}", parse_mode=None)
+
+    try:
+        # Hard wall-clock cap so a hung CLI can't pin the session forever.
+        await asyncio.wait_for(_consume(), timeout=TASK_TIMEOUT)
+    except asyncio.TimeoutError:
+        logger.warning(f"task {skey} timed out after {TASK_TIMEOUT}s")
+        error_msg = f"Tiempo límite agotado ({TASK_TIMEOUT}s) — tarea interrumpida."
+        await _interrupt_client(skey)
     except asyncio.CancelledError:
         logger.info(f"task {skey} cancelled")
-        raise
+        cancelled = True
+        # Swallow: we still want the finally to run _finish (drain queue, clean
+        # up status). Re-raising would propagate Cancelled into the finally's
+        # awaits and abort the drain.
     except Exception as exc:  # noqa: BLE001
         logger.error(f"run_task error: {exc}", exc_info=True)
-        await APP.bot.send_message(ADMIN_ID, f"❌ Error inesperado: {exc}")
+        error_msg = f"Error inesperado: {exc}"
     finally:
-        await _finish(skey, directory, final)
+        # Shield so a cancellation arriving during teardown can't abort the
+        # final reply or the queue drain (otherwise queued prompts vanish).
+        await asyncio.shield(
+            _finish(skey, directory, final, cancelled=cancelled, error_msg=error_msg))
 
 
 async def _dispatch(directory: str, skey: str, model: str, text: str):
@@ -470,35 +609,52 @@ async def _dispatch(directory: str, skey: str, model: str, text: str):
         QUEUES.setdefault(skey, deque()).append(
             {"text": text, "directory": directory, "model": model})
         pos = len(QUEUES[skey])
-        await APP.bot.send_message(
-            ADMIN_ID,
+        await _safe_send(
             f"⏳ `{Path(directory).name}` ocupado. En cola (posición {pos}).",
-            parse_mode="Markdown")
+            parse_mode="Markdown",
+            plain_fallback=f"⏳ {Path(directory).name} ocupado. En cola (posición {pos}).")
         return
 
     # Reserve the slot synchronously before any await to prevent a second
     # message slipping through the STATUSES check during the Telegram round-trip.
     STATUSES[skey] = {"state": "reserving"}
 
-    resume_sid = _resume_for(skey)
-    sess_label = None
-    if resume_sid:
-        s = _find_session(resume_sid, directory)
-        if s:
-            sess_label = _session_label(s)
+    try:
+        resume_sid = _resume_for(skey)
+        sess_label = None
+        if resume_sid:
+            s = _find_session(resume_sid, directory)
+            if s:
+                sess_label = _session_label(s)
 
-    sess_line = f"\n💬 `{sess_label[:40]}`" if sess_label else ""
-    sent = await APP.bot.send_message(
-        ADMIN_ID,
-        f"⚪ *ESPERANDO* | 📂 `{Path(directory).name}`\n"
-        f"🧩 `{model}` | ⏱ `00:00`{sess_line}\n"
-        f"_Iniciando Claude Code…_\n\n_Pulsa_ /esc _para cancelar_",
-        parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup([[
-            InlineKeyboardButton("❌ Cancelar", callback_data="abort:")]]))
+        sess_line = f"\n💬 `{sess_label[:40]}`" if sess_label else ""
+        sent = await APP.bot.send_message(
+            ADMIN_ID,
+            f"⚪ *ESPERANDO* | 📂 `{Path(directory).name}`\n"
+            f"🧩 `{model}` | ⏱ `00:00`{sess_line}\n"
+            f"_Iniciando Claude Code…_\n\n_Pulsa_ /esc _para cancelar_",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("❌ Cancelar", callback_data="abort:")]]))
+    except Exception as exc:  # noqa: BLE001
+        # Posting the status message failed (network/flood/etc.). Free the slot
+        # so the session isn't wedged "busy" forever, and tell the user.
+        STATUSES.pop(skey, None)
+        logger.error(f"_dispatch failed to post status: {exc}", exc_info=True)
+        await _safe_send(
+            f"❌ No pude iniciar la tarea en `{Path(directory).name}` "
+            f"\\(error de red\\)\\. Reintenta\\.",
+            plain_fallback=f"❌ No pude iniciar la tarea en {Path(directory).name}. Reintenta.")
+        return
+
     _start_status(skey, directory, sent.message_id, model, sess_label)
     _track_msg(sent.message_id, skey, directory)
     RUNNING[skey] = {"client": None, "directory": directory}
+    # Record the in-flight task so a restart can detect it was interrupted.
+    try:
+        db.inflight_add(skey, directory, model, text, sent.message_id)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(f"inflight_add failed: {exc}")
 
     task = asyncio.create_task(_run_task(skey, directory, text, resume_sid, model))
     RUNNING[skey]["task"] = task
@@ -552,8 +708,16 @@ async def cmd_open(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def cb_ob(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
-    _, pk, pg = q.data.split(":")
-    path = Path(_val(int(pk)))
+    parts = q.data.split(":")
+    if len(parts) < 3:
+        await _expired(q)
+        return
+    _, pk, pg = parts
+    val = _val(int(pk))
+    if val == KEY_MISSING:
+        await _expired(q)
+        return
+    path = Path(val)
     if path.is_file():
         path = path.parent
     txt, kbd = _folder_kbd(path, int(pg))
@@ -564,8 +728,12 @@ async def cb_mkdir(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
     path = _val(int(q.data.split(":")[1]))
+    if path == KEY_MISSING:
+        await _expired(q)
+        return
     MKDIR_PENDING.clear()
-    MKDIR_PENDING.update({"path": path, "msg_id": q.message.message_id})
+    MKDIR_PENDING.update({"path": path, "msg_id": q.message.message_id,
+                          "ts": time.time()})
     await q.edit_message_text(f"📁 Nueva carpeta en `{Path(path).name}`\n\nEscribe el nombre:",
                               parse_mode="Markdown")
 
@@ -575,6 +743,9 @@ async def cb_os(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
     cwd = _val(int(q.data.split(":")[1]))
+    if not cwd or cwd == KEY_MISSING:
+        await _expired(q)
+        return
     sessions = _list_sessions(directory=cwd)
     if sessions:
         await _show_session_picker(q, cwd, sessions)
@@ -643,6 +814,9 @@ async def cb_newsess(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
     cwd = _val(int(q.data.split(":")[1]))
+    if not cwd or cwd == KEY_MISSING:
+        await _expired(q)
+        return
     await _show_model_picker(q, cwd)
 
 
@@ -651,8 +825,14 @@ async def cb_setmodel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
     parts = q.data.split(":")
+    if len(parts) <= 2:
+        await _expired(q)
+        return
     pk = int(parts[1])
     model = _val(int(parts[2]))
+    if not model or model == KEY_MISSING:  # stale → would persist an empty model
+        await _expired(q)
+        return
 
     if pk == -1:  # /models mode → change active session model
         active = db.get_active()
@@ -667,6 +847,9 @@ async def cb_setmodel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
     cwd = _val(pk)
+    if not cwd or cwd == KEY_MISSING:
+        await _expired(q)
+        return
     KNOWN_SID.pop(_skey(cwd, None), None)  # force truly new session, not a resume
     db.set_active(cwd, None, model)  # new session, materializes on first prompt
     await q.edit_message_text(
@@ -678,8 +861,14 @@ async def cb_actsess(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
     parts = q.data.split(":")
-    sid = _val(int(parts[1]))
-    cwd = _val(int(parts[2])) if len(parts) > 2 else ""
+    if len(parts) <= 2:
+        await _expired(q)
+        return
+    vals = _vals(int(parts[1]), int(parts[2]))
+    if vals is None or not vals[0] or not vals[1]:
+        await _expired(q)  # stale button → don't clobber the active pointer with ""
+        return
+    sid, cwd = vals
     meta = db.get_session_meta(sid)
     model = (meta or {}).get("model") or cc.DEFAULT_MODEL
     db.set_active(cwd, sid, model)
@@ -696,8 +885,14 @@ async def cb_delsess(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
     parts = q.data.split(":")
-    sid = _val(int(parts[1]))
-    cwd = _val(int(parts[2])) if len(parts) > 2 else ""
+    if len(parts) <= 2:
+        await _expired(q)
+        return
+    vals = _vals(int(parts[1]), int(parts[2]))
+    if vals is None or not vals[0]:
+        await _expired(q)
+        return
+    sid, cwd = vals
     from_sessions = len(parts) > 3 and parts[3] == "s"
     try:
         sdk.delete_session(sid, directory=cwd or None)
@@ -775,6 +970,9 @@ async def cb_sesspick(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
     cwd = _val(int(q.data.split(":")[1]))
+    if not cwd or cwd == KEY_MISSING:
+        await _expired(q)
+        return
     sessions = _list_sessions(directory=cwd)
     if sessions:
         await _show_session_picker(q, cwd, sessions, mode="sessions")
@@ -814,7 +1012,17 @@ async def cmd_close(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def cb_closedir(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
-    cwd = _val(int(q.data.split(":")[1]))
+    vals = _vals(int(q.data.split(":")[1]))
+    if vals is None:
+        await _expired(q)
+        return
+    cwd = vals[0]
+    # Hard guard: never operate on an empty directory. _list_sessions("")
+    # returns sessions for *every* project, so a stale/empty cwd here would
+    # wipe unrelated projects' sessions.
+    if not cwd:
+        await _expired(q)
+        return
     sessions = _list_sessions(directory=cwd)
     deleted = 0
     for s in sessions:
@@ -928,10 +1136,7 @@ async def cmd_btw(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     except BadRequest:
         await status.edit_text(chunks[0])
     for c in chunks[1:]:
-        try:
-            await APP.bot.send_message(ADMIN_ID, md2tgv2.convert(c), parse_mode="MarkdownV2")
-        except BadRequest:
-            await APP.bot.send_message(ADMIN_ID, c)
+        await _safe_send(md2tgv2.convert(c), plain_fallback=c)
 
 
 PERM_MODES = ["bypassPermissions", "acceptEdits", "default", "plan"]
@@ -955,7 +1160,11 @@ async def cb_perm_mode(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     global PERMISSION_MODE
     q = update.callback_query
     await q.answer()
-    PERMISSION_MODE = _val(int(q.data.split(":")[1]))
+    mode = _val(int(q.data.split(":")[1]))
+    if not mode or mode == KEY_MISSING or mode not in PERM_MODES:
+        await _expired(q)
+        return
+    PERMISSION_MODE = mode
     await q.edit_message_text(f"🔐 Modo de permisos: `{PERMISSION_MODE}`",
                               parse_mode="Markdown")
 
@@ -963,16 +1172,24 @@ async def cb_perm_mode(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 # --------------------------------------------------------------------------- #
 # /esc
 # --------------------------------------------------------------------------- #
-async def _abort(skey: str) -> str:
+async def _interrupt_client(skey: str) -> None:
+    """Ask the running Claude client to interrupt (best-effort, never raises)."""
     entry = RUNNING.get(skey)
     if not entry:
-        return "⚠️ No hay tarea en curso."
+        return
     client = entry.get("client")
     if client:
         try:
             await client.interrupt()
         except Exception:  # noqa: BLE001
             pass
+
+
+async def _abort(skey: str) -> str:
+    entry = RUNNING.get(skey)
+    if not entry:
+        return "⚠️ No hay tarea en curso."
+    await _interrupt_client(skey)
     task = entry.get("task")
     if task and not task.done():
         task.cancel()
@@ -1135,6 +1352,9 @@ async def cb_sendpick(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
     cwd = _val(int(q.data.split(":")[1]))
+    if not cwd or cwd == KEY_MISSING:
+        await _expired(q)
+        return
     sessions = _list_sessions(directory=cwd)
     await _show_session_picker(q, cwd, sessions, mode="send")
 
@@ -1223,8 +1443,14 @@ async def cb_sendsess(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
     parts = q.data.split(":")
-    sid = _val(int(parts[1]))
-    cwd = _val(int(parts[2]))
+    if len(parts) <= 2:
+        await _expired(q)
+        return
+    vals = _vals(int(parts[1]), int(parts[2]))
+    if vals is None or not vals[0] or not vals[1]:
+        await _expired(q)
+        return
+    sid, cwd = vals
     meta = db.get_session_meta(sid)
     model = (meta or {}).get("model") or cc.DEFAULT_MODEL
     s = _find_session(sid, cwd)
@@ -1239,6 +1465,9 @@ async def cb_sendnew(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await q.answer()
     pk = int(q.data.split(":")[1])
     cwd = _val(pk)
+    if not cwd or cwd == KEY_MISSING:
+        await _expired(q)
+        return
     btns = [[InlineKeyboardButton("🧩 " + m, callback_data=f"sendmodel:{pk}:{_key(m)}")]
             for m in cc.MODELS]
     btns.append([InlineKeyboardButton("❌ Cancelar", callback_data="cancel:")])
@@ -1252,8 +1481,14 @@ async def cb_sendmodel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
     parts = q.data.split(":")
-    cwd = _val(int(parts[1]))
-    model = _val(int(parts[2]))
+    if len(parts) <= 2:
+        await _expired(q)
+        return
+    vals = _vals(int(parts[1]), int(parts[2]))
+    if vals is None or not vals[0] or not vals[1]:
+        await _expired(q)
+        return
+    cwd, model = vals
     new_skey = _skey(cwd, None)
     KNOWN_SID.pop(new_skey, None)  # force truly new session, not a resume
     await _send_to_target(q, cwd, new_skey, model,
@@ -1265,8 +1500,14 @@ async def cb_senddel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
     parts = q.data.split(":")
-    sid = _val(int(parts[1]))
-    cwd = _val(int(parts[2])) if len(parts) > 2 else ""
+    if len(parts) <= 2:
+        await _expired(q)
+        return
+    vals = _vals(int(parts[1]), int(parts[2]))
+    if vals is None or not vals[0]:
+        await _expired(q)
+        return
+    sid, cwd = vals
     try:
         sdk.delete_session(sid, directory=cwd or None)
     except Exception as exc:  # noqa: BLE001
@@ -1322,14 +1563,22 @@ async def handle_file(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await msg.reply_text("❌ No hay sesión activa. Usa /open.")
         return
     cwd = active["directory"]
-    save_path = Path(cwd) / file_name
+    # Sanitize: strip any directory components so a crafted name like "../x"
+    # or "/etc/x" can't write outside the project folder.
+    safe_name = Path(file_name).name or f"file_{int(time.time())}"
+    save_path = Path(cwd) / safe_name
+    # Anti-collision: never silently overwrite an existing file.
+    if save_path.exists():
+        stem, suffix = save_path.stem, save_path.suffix
+        save_path = save_path.with_name(f"{stem}_{int(time.time())}{suffix}")
+        safe_name = save_path.name
     try:
         tg = await ctx.bot.get_file(file_id)
         await tg.download_to_drive(save_path)
     except Exception as exc:  # noqa: BLE001
         await msg.reply_text(f"❌ Error al guardar: {exc}")
         return
-    await msg.reply_text(f"✅ `{file_name}` guardado en `{Path(cwd).name}`.",
+    await msg.reply_text(f"✅ `{safe_name}` guardado en `{Path(cwd).name}`.",
                          parse_mode="Markdown")
 
 
@@ -1379,23 +1628,33 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     # Pending mkdir name?
     if MKDIR_PENDING:
-        parent = Path(MKDIR_PENDING["path"])
-        new_dir = parent / text.strip()
-        msg_id = MKDIR_PENDING.get("msg_id")
-        MKDIR_PENDING.clear()
-        try:
-            new_dir.mkdir(parents=False, exist_ok=False)
-        except Exception as exc:  # noqa: BLE001
-            await update.message.reply_text(f"❌ {exc}")
+        # Expire stale flows so a forgotten "new folder" prompt doesn't swallow
+        # a later normal message as a folder name.
+        if time.time() - MKDIR_PENDING.get("ts", 0) > PENDING_FLOW_TTL:
+            MKDIR_PENDING.clear()
+        else:
+            parent = Path(MKDIR_PENDING["path"])
+            # Sanitize: only a single path component, no traversal.
+            name = Path(text.strip()).name
+            msg_id = MKDIR_PENDING.get("msg_id")
+            MKDIR_PENDING.clear()
+            if not name:
+                await update.message.reply_text("❌ Nombre de carpeta no válido.")
+                return
+            new_dir = parent / name
+            try:
+                new_dir.mkdir(parents=False, exist_ok=False)
+            except Exception as exc:  # noqa: BLE001
+                await update.message.reply_text(f"❌ {exc}")
+                return
+            txt, kbd = _folder_kbd(new_dir, 0)
+            try:
+                await ctx.bot.edit_message_text(chat_id=ADMIN_ID, message_id=msg_id,
+                                                text=txt, reply_markup=kbd, parse_mode="Markdown")
+            except Exception:  # noqa: BLE001
+                await update.message.reply_text(txt, reply_markup=kbd, parse_mode="Markdown")
+            await update.message.reply_text(f"✅ Carpeta `{name}` creada.", parse_mode="Markdown")
             return
-        txt, kbd = _folder_kbd(new_dir, 0)
-        try:
-            await ctx.bot.edit_message_text(chat_id=ADMIN_ID, message_id=msg_id,
-                                            text=txt, reply_markup=kbd, parse_mode="Markdown")
-        except Exception:  # noqa: BLE001
-            await update.message.reply_text(txt, reply_markup=kbd, parse_mode="Markdown")
-        await update.message.reply_text(f"✅ Carpeta `{text}` creada.", parse_mode="Markdown")
-        return
 
     # Pending custom question answer?
     if "q_custom_qid" in ctx.bot_data:
@@ -1513,14 +1772,42 @@ async def cmd_restart(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 # --------------------------------------------------------------------------- #
 # App
 # --------------------------------------------------------------------------- #
+async def on_error(update: object, ctx: ContextTypes.DEFAULT_TYPE):
+    """Global error handler: nothing should fail silently. Log with traceback
+    and tell the admin what blew up (so a stuck 'loading' button always gets a
+    follow-up message)."""
+    err = ctx.error
+    if isinstance(err, asyncio.CancelledError):
+        return
+    logger.error("Unhandled error in handler", exc_info=err)
+    # Surface a short, safe summary to the admin. Never raise from here.
+    try:
+        where = ""
+        if isinstance(update, Update):
+            if update.callback_query and update.callback_query.data:
+                where = f" (botón `{update.callback_query.data}`)"
+            elif update.effective_message and update.effective_message.text:
+                where = f" (mensaje «{update.effective_message.text[:40]}»)"
+        msg = f"⚠️ Fallo interno{where}:\n`{type(err).__name__}: {str(err)[:300]}`"
+        await APP.bot.send_message(ADMIN_ID, msg, parse_mode="Markdown")
+    except Exception:  # noqa: BLE001
+        try:
+            await APP.bot.send_message(ADMIN_ID, "⚠️ Fallo interno (ver logs).")
+        except Exception:  # noqa: BLE001
+            pass
+
+
 def main():
-    global APP
+    global APP, KEYSTORE
     db.init()
+    KEYSTORE = db.load_keystore()  # restore so pre-restart buttons still resolve
     cc.set_question_bridge(_question_bridge)
 
     asyncio.set_event_loop(asyncio.new_event_loop())  # Python 3.14 fix
     app = Application.builder().token(TOKEN).build()
     APP = app
+
+    app.add_error_handler(on_error)
 
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
@@ -1582,6 +1869,37 @@ def main():
             BotCommand("esc", "Cancelar tarea"),
             BotCommand("restart", "Reiniciar bot"),
         ])
+
+        # Orphan recovery: any in-flight task row means a prompt was running
+        # when the process died (crash, redeploy, /restart). The Claude
+        # subprocess is gone and its status message is frozen — clean it up and
+        # tell the user, so nothing looks "stuck working" forever.
+        try:
+            orphans = db.inflight_all()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"inflight_all failed: {exc}")
+            orphans = []
+        if orphans:
+            for o in orphans:
+                if o.get("msg_id"):
+                    await _delete_msg(application.bot, o["msg_id"])
+            try:
+                db.inflight_clear()
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(f"inflight_clear failed: {exc}")
+            lines = ["⚠️ *El bot se reinició mientras trabajaba.*",
+                     "Estas tareas se interrumpieron (no se perdió tu historial, "
+                     "pero conviene revisarlas):"]
+            for o in orphans[:10]:
+                name = Path(o.get("directory", "")).name or "?"
+                prm = (o.get("prompt") or "").replace("\n", " ")[:50]
+                lines.append(f"• 📂 `{name}` — _{prm}_" if prm else f"• 📂 `{name}`")
+            try:
+                await application.bot.send_message(
+                    ADMIN_ID, "\n".join(lines), parse_mode="Markdown")
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(f"orphan notice failed: {exc}")
+
         if RESTART_FLAG.exists():
             try:
                 mid = int(RESTART_FLAG.read_text().strip())

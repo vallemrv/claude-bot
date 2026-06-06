@@ -18,8 +18,13 @@ DB_PATH = Path(__file__).parent.parent / "bot.db"
 
 
 def _conn() -> sqlite3.Connection:
-    con = sqlite3.connect(DB_PATH)
+    # timeout: wait (instead of raising "database is locked") when a concurrent
+    # writer holds the lock — the bot fires DB ops from the queue + callbacks.
+    con = sqlite3.connect(DB_PATH, timeout=10)
     con.row_factory = sqlite3.Row
+    # WAL lets readers and a writer coexist without blocking each other.
+    con.execute("PRAGMA journal_mode=WAL")
+    con.execute("PRAGMA busy_timeout=10000")
     return con
 
 
@@ -40,6 +45,28 @@ def init() -> None:
                 model             TEXT,
                 title             TEXT,
                 created_at        REAL
+            )
+        """)
+        # Persisted callback keystore: maps the small ints embedded in
+        # callback_data to their real string value. Persisting it means inline
+        # buttons from before a restart still resolve (no silent "" surprises).
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS keystore (
+                k     INTEGER PRIMARY KEY,
+                value TEXT NOT NULL UNIQUE
+            )
+        """)
+        # In-flight task ledger: a row exists while a prompt is running so a
+        # restart can detect tasks that were interrupted mid-flight and clean
+        # up their orphaned status messages.
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS inflight (
+                skey       TEXT PRIMARY KEY,
+                directory  TEXT NOT NULL,
+                model      TEXT,
+                prompt     TEXT,
+                msg_id     INTEGER,
+                started_at REAL
             )
         """)
 
@@ -142,3 +169,57 @@ def forget_session(claude_session_id: str) -> None:
             "DELETE FROM session_meta WHERE claude_session_id = ?",
             (claude_session_id,),
         )
+
+
+# --------------------------------------------------------------------------- #
+# Persisted callback keystore (compresses long callback_data values to ints)
+# --------------------------------------------------------------------------- #
+def load_keystore() -> dict[int, str]:
+    """Return the whole keystore as {k: value}. Called once at startup."""
+    with _conn() as con:
+        rows = con.execute("SELECT k, value FROM keystore").fetchall()
+        return {row["k"]: row["value"] for row in rows}
+
+
+def keystore_put(k: int, value: str) -> None:
+    with _conn() as con:
+        con.execute(
+            "INSERT OR IGNORE INTO keystore (k, value) VALUES (?, ?)",
+            (k, value),
+        )
+
+
+# --------------------------------------------------------------------------- #
+# In-flight task ledger (survives restarts → orphan detection)
+# --------------------------------------------------------------------------- #
+def inflight_add(skey: str, directory: str, model: str | None,
+                 prompt: str | None, msg_id: int | None) -> None:
+    with _conn() as con:
+        con.execute("""
+            INSERT INTO inflight (skey, directory, model, prompt, msg_id, started_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(skey) DO UPDATE SET
+                directory = excluded.directory,
+                model = excluded.model,
+                prompt = excluded.prompt,
+                msg_id = excluded.msg_id,
+                started_at = excluded.started_at
+        """, (skey, directory, model, prompt, msg_id, time.time()))
+
+
+def inflight_remove(skey: str) -> None:
+    with _conn() as con:
+        con.execute("DELETE FROM inflight WHERE skey = ?", (skey,))
+
+
+def inflight_all() -> list[dict]:
+    with _conn() as con:
+        rows = con.execute(
+            "SELECT skey, directory, model, prompt, msg_id, started_at FROM inflight"
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def inflight_clear() -> None:
+    with _conn() as con:
+        con.execute("DELETE FROM inflight")
