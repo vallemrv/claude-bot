@@ -1750,23 +1750,48 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def cmd_restart(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     import subprocess
     service = "claude-bot.service"
-    # Existence check that finishes *before* anything kills us (unlike a plain
-    # `restart`, whose own systemctl gets SIGTERM'd inside the service cgroup
-    # and falsely reports failure). `cat` → rc 0 if the unit exists.
-    exists = subprocess.run(["systemctl", "--user", "cat", service],
-                            capture_output=True, text=True).returncode == 0
-    if not exists:
+
+    # Detect how the bot is running and pick the matching systemctl invocation.
+    # Order: user unit (preferred — Claude's login lives in this user's
+    # ~/.claude) → system unit via passwordless sudo. We probe with `cat`, which
+    # finishes *before* anything kills us (a plain `restart` would get SIGTERM'd
+    # mid-run inside our own cgroup and falsely report failure). `-n` on sudo so
+    # it never blocks waiting for a password nobody can type from Telegram.
+    def _unit_exists(cmd: list[str]) -> bool:
+        try:
+            return subprocess.run(cmd + ["cat", service],
+                                  capture_output=True, text=True,
+                                  timeout=10).returncode == 0
+        except Exception:  # noqa: BLE001
+            return False
+
+    if _unit_exists(["systemctl", "--user"]):
+        restart_cmd = ["systemd-run", "--user", "--collect",
+                       "systemctl", "--user", "restart", service]
+    elif _unit_exists(["sudo", "-n", "systemctl"]):
+        # System unit reachable with passwordless sudo. Detach via a transient
+        # *system* unit so the restart survives our own SIGTERM.
+        restart_cmd = ["sudo", "-n", "systemd-run", "--collect",
+                       "systemctl", "restart", service]
+    else:
         await update.message.reply_text(
-            "⚠️ No hay servicio systemd `claude-bot.service`.\n"
-            "Reinícialo a mano con `./run.sh`.", parse_mode="Markdown")
+            "⚠️ No puedo reiniciar automáticamente.\n"
+            "• Como servicio de usuario: `systemctl --user restart claude-bot`\n"
+            "• Como servicio de sistema: `sudo systemctl restart claude-bot` "
+            "(requiere sudo sin contraseña para hacerlo desde aquí)\n"
+            "• A mano: `./run.sh`", parse_mode="Markdown")
         return
+
     msg = await update.message.reply_text("🔄 Reiniciando…")
     RESTART_FLAG.write_text(str(msg.message_id))
-    # Detach the restart into its own transient unit (separate cgroup) so it
-    # survives when systemd stops this service. Fire-and-forget; the success
-    # message is shown by post_init via RESTART_FLAG once we come back up.
-    subprocess.Popen(["systemd-run", "--user", "--collect",
-                      "systemctl", "--user", "restart", service])
+    # Fire-and-forget; the success message is shown by post_init via
+    # RESTART_FLAG once we come back up.
+    try:
+        subprocess.Popen(restart_cmd)
+    except Exception as exc:  # noqa: BLE001
+        RESTART_FLAG.unlink(missing_ok=True)
+        await _safe_send(f"❌ No pude lanzar el reinicio: `{exc}`",
+                         plain_fallback=f"❌ No pude lanzar el reinicio: {exc}")
 
 
 # --------------------------------------------------------------------------- #

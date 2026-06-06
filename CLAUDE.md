@@ -125,11 +125,15 @@ are awaited Futures resolved by callback handlers.
 - **`/multisesion` / `/exitmulti`**: an "always ask" mode — every clean (non-reply)
   message re-launches the project→session wizard; the chosen destination is
   **transient** (cleared after one dispatch), never sticky.
-- **`/restart`**: must launch the restart **detached** via
-  `systemd-run --user --collect systemctl --user restart claude-bot.service`. A plain
-  `systemctl restart` from inside the bot lives in the service's own cgroup and gets
-  SIGTERM'd mid-restart → false "service not found". Existence is checked first with
-  `systemctl --user cat` (which finishes before any kill).
+- **`/restart`**: auto-detects whether the bot runs as a **user** unit
+  (preferred — Claude's login lives in this user's `~/.claude`) or a **system**
+  unit, and uses the matching `systemctl`. It probes with `systemctl --user cat`
+  first, then `sudo -n systemctl cat` (`-n` so it never blocks on a password
+  nobody can type from Telegram); `cat` finishes before any kill, unlike a plain
+  `restart` which would get SIGTERM'd inside its own cgroup → false "not found".
+  The actual restart is launched **detached** via `systemd-run … --collect` so it
+  survives our SIGTERM. If neither mode is reachable it explains the options
+  instead of failing silently.
 - Final replies > `MD_FILE_THRESHOLD` (~6000 chars) are sent as a `respuesta.md`
   document; otherwise chunked. All markdown goes through `md2tgv2.convert()` →
   MarkdownV2, with a plain-text fallback on `BadRequest`.

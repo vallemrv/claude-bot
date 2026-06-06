@@ -1,12 +1,25 @@
-# Servicio systemd de USUARIO para claude-bot.
-# Instalación:
+# Servicio systemd para claude-bot.
+#
+# === Modo recomendado: servicio de USUARIO ===
+# (Claude Code usa el login local en ~/.claude del usuario, por eso es lo
+#  natural; /restart desde Telegram funciona sin sudo.)
 #   mkdir -p ~/.config/systemd/user
 #   cp claude-bot.service.example ~/.config/systemd/user/claude-bot.service
 #   systemctl --user daemon-reload
 #   systemctl --user enable --now claude-bot.service
 #   loginctl enable-linger $USER   # para que siga tras cerrar sesión
+#   Logs:   journalctl --user -u claude-bot -f
 #
-# Logs:   journalctl --user -u claude-bot -f
+# === Alternativa: servicio de SISTEMA (sudo systemctl) ===
+# Solo si lo prefieres así. Debe correr como tu usuario (NO root) para que
+# Claude encuentre su login:
+#   1) Copia este archivo a /etc/systemd/system/claude-bot.service
+#   2) Añade bajo [Service]:  User=valle   (y opcionalmente  Group=valle)
+#   3) sudo systemctl daemon-reload && sudo systemctl enable --now claude-bot
+#   4) Para que /restart funcione desde Telegram sin contraseña, crea
+#      /etc/sudoers.d/claude-bot con (visudo):
+#        valle ALL=(root) NOPASSWD: /usr/bin/systemctl restart claude-bot.service, /usr/bin/systemd-run
+#   El bot detecta solo si es user o system y usa el systemctl adecuado.
 
 [Unit]
 Description=claude-bot - Claude Code por Telegram
@@ -14,6 +27,8 @@ After=network-online.target
 
 [Service]
 Type=simple
+# Para servicio de SISTEMA, descomenta y ajusta:
+# User=valle
 WorkingDirectory=/home/valle/proyectos/claude-bot
 Environment=PYTHONUNBUFFERED=1
 ExecStart=/home/valle/proyectos/claude-bot/.venv/bin/python /home/valle/proyectos/claude-bot/src/telegram_bot.py
