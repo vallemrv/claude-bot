@@ -1044,20 +1044,6 @@ async def cb_sesspick(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 @admin_only
-async def cmd_projects(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    by_dir = _group_by_dir(_list_sessions())
-    if not by_dir:
-        await update.message.reply_text("No hay proyectos con sesiones. Usa /open.")
-        return
-    active_dir = (db.get_active() or {}).get("directory", "")
-    lines = ["*Proyectos con sesiones*\n"]
-    for d in sorted(by_dir):
-        marker = " ◀ activo" if d == active_dir else ""
-        lines.append(f"📂 *{Path(d).name}*{marker} — {len(by_dir[d])} sesión(es)")
-    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
-
-
-@admin_only
 async def cmd_close(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     by_dir = _group_by_dir(_list_sessions())
     if not by_dir:
@@ -1798,7 +1784,6 @@ HELP = (
     "*claude-bot* — Claude Code por Telegram\n\n"
     "/open — navegar carpetas, abrir proyecto / sesión\n"
     "/sessions — gestionar sesiones de un proyecto\n"
-    "/projects — proyectos con sesiones\n"
     "/models — cambiar modelo (opus/sonnet/haiku)\n"
     "/rename — renombrar la sesión activa (`/rename mi nombre`)\n"
     "/btw — pregunta rápida sobre la sesión, sin tocar su historial\n"
@@ -1933,7 +1918,6 @@ def main():
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("open", cmd_open))
     app.add_handler(CommandHandler("sessions", cmd_sessions))
-    app.add_handler(CommandHandler("projects", cmd_projects))
     app.add_handler(CommandHandler("close", cmd_close))
     app.add_handler(CommandHandler("models", cmd_models))
     app.add_handler(CommandHandler("rename", cmd_rename))
