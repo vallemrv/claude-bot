@@ -33,6 +33,7 @@ import db
 import md2tgv2
 import transcription as grok_stt
 import claude_client as cc
+import gitops
 
 # --------------------------------------------------------------------------- #
 # Config
@@ -66,6 +67,8 @@ KEYSTORE: dict = {}        # int -> str   (compress long strings for callback_da
 PENDING_PERMS: dict = {}   # qid -> asyncio.Future
 PENDING_Q: dict = {}       # qid -> {"future", "options": [str]}
 LAST_EDITED: dict = {}     # skey -> {relpath: icon}  (files from most recent run)
+UNDO_STACK: dict = {}      # directory -> [snapshot_sha, ...]  (más reciente al final)
+REDO_STACK: dict = {}      # directory -> [snapshot_sha, ...]
 SEND_MODE = {"on": False, "target": None, "pending_text": None,
              "oneshot": False, "oneshot_pre": False}
 MKDIR_PENDING: dict = {}   # {"path","msg_id"}
@@ -567,6 +570,12 @@ async def _finish(skey: str, directory: str, final: dict | None,
         files = st.get("files_edited", {})
         if files:
             LAST_EDITED[skey] = dict(files)
+            pre = st.get("pre_snapshot")
+            if pre:
+                UNDO_STACK.setdefault(directory, []).append(pre)
+                REDO_STACK.pop(directory, None)
+                if len(UNDO_STACK[directory]) > 50:
+                    UNDO_STACK[directory] = UNDO_STACK[directory][-50:]
         await _send_reply(skey, directory, st, final,
                           cancelled=cancelled, error_msg=error_msg)
     await _drain_queue(skey, directory)
@@ -660,6 +669,12 @@ async def _run_task(skey: str, directory: str, prompt: str,
             elif t == "error":
                 error_msg = ev["message"]
                 await _safe_send(f"❌ Error: {ev['message'][:1500]}", parse_mode=None)
+
+    if st is not None:
+        try:
+            st["pre_snapshot"] = await asyncio.to_thread(gitops.snapshot, directory)
+        except Exception:  # noqa: BLE001
+            st["pre_snapshot"] = None
 
     try:
         # Hard wall-clock cap so a hung CLI can't pin the session forever.
@@ -1498,6 +1513,147 @@ async def cmd_cambios(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 # --------------------------------------------------------------------------- #
+# /undo /redo /status
+# --------------------------------------------------------------------------- #
+@admin_only
+async def cmd_undo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    active = db.get_active()
+    if not active or not active.get("directory"):
+        await update.message.reply_text("⚠️ No hay sesión activa. Usa /open.")
+        return
+    directory = active["directory"]
+    skey = _skey(directory, active.get("claude_session_id"))
+    if skey in STATUSES:
+        await update.message.reply_text("⏳ La sesión está ocupada. Espera a que termine.")
+        return
+    if not await asyncio.to_thread(gitops.is_git_repo, directory):
+        await update.message.reply_text("⚠️ Este proyecto no es un repositorio git.")
+        return
+    stack = UNDO_STACK.get(directory) or []
+    if not stack:
+        await update.message.reply_text("↩️ No hay nada que deshacer.")
+        return
+    cur = await asyncio.to_thread(gitops.snapshot, directory)
+    target = stack.pop()
+    ok, err = await asyncio.to_thread(gitops.restore, directory, target)
+    if not ok:
+        stack.append(target)
+        await update.message.reply_text(f"❌ No se pudo deshacer: {err}")
+        return
+    if cur:
+        REDO_STACK.setdefault(directory, []).append(cur)
+    LAST_EDITED.pop(skey, None)
+    await update.message.reply_text(
+        f"↩️ Deshecho. Quedan {len(stack)} paso(s) para deshacer, "
+        f"{len(REDO_STACK.get(directory, []))} para rehacer.\n"
+        "Usa /status para ver el estado o /redo para rehacer.")
+
+
+@admin_only
+async def cmd_redo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    active = db.get_active()
+    if not active or not active.get("directory"):
+        await update.message.reply_text("⚠️ No hay sesión activa. Usa /open.")
+        return
+    directory = active["directory"]
+    skey = _skey(directory, active.get("claude_session_id"))
+    if skey in STATUSES:
+        await update.message.reply_text("⏳ La sesión está ocupada. Espera a que termine.")
+        return
+    if not await asyncio.to_thread(gitops.is_git_repo, directory):
+        await update.message.reply_text("⚠️ Este proyecto no es un repositorio git.")
+        return
+    stack = REDO_STACK.get(directory) or []
+    if not stack:
+        await update.message.reply_text("↪️ No hay nada que rehacer.")
+        return
+    cur = await asyncio.to_thread(gitops.snapshot, directory)
+    target = stack.pop()
+    ok, err = await asyncio.to_thread(gitops.restore, directory, target)
+    if not ok:
+        stack.append(target)
+        await update.message.reply_text(f"❌ No se pudo rehacer: {err}")
+        return
+    if cur:
+        UNDO_STACK.setdefault(directory, []).append(cur)
+    LAST_EDITED.pop(skey, None)
+    await update.message.reply_text(
+        f"↪️ Rehecho. Quedan {len(UNDO_STACK.get(directory, []))} paso(s) para deshacer, "
+        f"{len(stack)} para rehacer.\n"
+        "Usa /status para ver el estado o /undo para deshacer.")
+
+
+@admin_only
+async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    active = db.get_active()
+    if not active or not active.get("directory"):
+        await update.message.reply_text("⚠️ No hay sesión activa. Usa /open.")
+        return
+    directory = active["directory"]
+    info = await asyncio.to_thread(gitops.repo_status, directory)
+    if not info.get("is_repo"):
+        await update.message.reply_text("⚠️ Este proyecto no es un repositorio git.")
+        return
+    branch = info.get("branch", "?")
+    if info.get("clean"):
+        await update.message.reply_text(
+            f"✅ Working tree limpio en `{Path(directory).name}` "
+            f"(rama `{branch}`). Nada que commitear.",
+            parse_mode="Markdown")
+        return
+    total_a = info.get("total_added", 0)
+    total_r = info.get("total_removed", 0)
+    lines = [
+        f"📊 *{Path(directory).name}* · rama `{branch}`",
+        f"   +{total_a} / -{total_r} líneas en total",
+        "",
+    ]
+    FILE_LIMIT = 40
+    per_file = info.get("per_file", {})
+    icon_map = {
+        "created": "🆕", "modified": "✏️", "deleted": "🗑️", "renamed": "🔀",
+    }
+    all_files = []
+    for kind in ("created", "modified", "deleted", "renamed"):
+        for path in info.get(kind, []):
+            all_files.append((icon_map[kind], path))
+    shown = all_files[:FILE_LIMIT]
+    for ico, path in shown:
+        stats = per_file.get(path)
+        if stats:
+            lines.append(f"  {ico} `{path}`  (+{stats['added']} -{stats['removed']})")
+        else:
+            lines.append(f"  {ico} `{path}`")
+    if len(all_files) > FILE_LIMIT:
+        lines.append(f"  … y {len(all_files) - FILE_LIMIT} archivo(s) más")
+    texto = "\n".join(lines)
+    kbd = InlineKeyboardMarkup([[InlineKeyboardButton(
+        "✅ Commit y push", callback_data=f"commitpush:{_key(directory)}")]])
+    try:
+        await update.message.reply_text(texto, parse_mode="Markdown", reply_markup=kbd)
+    except Exception:  # noqa: BLE001
+        await update.message.reply_text(texto, reply_markup=kbd)
+
+
+async def cb_commitpush(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    dkey = int(q.data.split(":")[1])
+    directory = _val(dkey)
+    if directory == KEY_MISSING or not directory:
+        await _expired(q)
+        return
+    kbd = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancelar", callback_data="cancel:")]])
+    msg = await q.edit_message_text(
+        "✍️ Escribe el mensaje del commit (`-m`). El próximo mensaje se usará como tal.",
+        parse_mode="Markdown", reply_markup=kbd)
+    msg_id = msg.message_id if hasattr(msg, "message_id") else q.message.message_id
+    PENDING_INPUT.clear()
+    PENDING_INPUT.update({"kind": "commit", "directory": directory,
+                          "msg_id": msg_id, "ts": time.time()})
+
+
+# --------------------------------------------------------------------------- #
 # Permission + question bridges (used in non-bypass modes / ask_user tool)
 # --------------------------------------------------------------------------- #
 def _ctx_line() -> str:
@@ -1937,6 +2093,13 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             elif kind == "btw":
                 await _run_btw(update, arg, pend["directory"], pend["sid"],
                                pend.get("model") or cc.DEFAULT_MODEL)
+            elif kind == "commit":
+                await update.message.reply_text("⏳ Haciendo commit y push…")
+                ok, summary = await asyncio.to_thread(gitops.commit_push, pend["directory"], arg)
+                if ok:
+                    await update.message.reply_text(f"✅ {summary}")
+                else:
+                    await update.message.reply_text(f"❌ {summary}")
             return
 
     # Pending mkdir name?
@@ -2166,6 +2329,9 @@ def main():
     app.add_handler(CommandHandler("rename", cmd_rename))
     app.add_handler(CommandHandler("btw", cmd_btw))
     app.add_handler(CommandHandler("cambios", cmd_cambios))
+    app.add_handler(CommandHandler("undo", cmd_undo))
+    app.add_handler(CommandHandler("redo", cmd_redo))
+    app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("permisos", cmd_permisos))
     app.add_handler(CommandHandler("send", cmd_send))
     app.add_handler(CommandHandler("multisesion", cmd_multisesion))
@@ -2196,6 +2362,7 @@ def main():
     app.add_handler(CallbackQueryHandler(cb_sendmodel, pattern=r"^sendmodel:"))
     app.add_handler(CallbackQueryHandler(cb_senddel, pattern=r"^senddel:"))
     app.add_handler(CallbackQueryHandler(cb_abort, pattern=r"^abort:"))
+    app.add_handler(CallbackQueryHandler(cb_commitpush, pattern=r"^commitpush:"))
     app.add_handler(CallbackQueryHandler(cb_cancel, pattern=r"^cancel:"))
 
     app.add_handler(MessageHandler(filters.Document.ALL | filters.PHOTO | filters.VIDEO, handle_file))
@@ -2223,6 +2390,9 @@ def main():
             BotCommand("rename", "Renombrar sesión activa"),
             BotCommand("btw", "Pregunta rápida (no afecta historial)"),
             BotCommand("cambios", "Archivos modificados en la última ejecución"),
+            BotCommand("status", "Estado git del proyecto (+ commit y push)"),
+            BotCommand("undo", "Deshacer los cambios de la última ejecución"),
+            BotCommand("redo", "Rehacer lo último deshecho"),
             BotCommand("permisos", "Modo de permisos"),
             BotCommand("send", "Envío único a sesión específica"),
             BotCommand("multisesion", "Preguntar destino en cada mensaje"),
