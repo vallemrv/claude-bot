@@ -1703,15 +1703,53 @@ async def cb_perm_answer(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await q.edit_message_text("✅ Permitido" if val == "1" else "❌ Denegado")
 
 
-async def _question_bridge(question: str, options: str) -> str:
+def _normalize_options(options) -> list[str]:
+    """Options arrive as a real array (preferred) or, for older callers, a
+    comma-separated string. Normalize to a clean, de-duplicated list — never
+    split an array element on its internal commas (that shattered one answer
+    into several buttons)."""
+    if isinstance(options, str):
+        raw = [o.strip() for o in options.split(",")]
+    elif isinstance(options, (list, tuple)):
+        raw = [str(o).strip() for o in options]
+    else:
+        raw = []
+    seen: set[str] = set()
+    opts: list[str] = []
+    for o in raw:
+        if o and o not in seen:
+            seen.add(o)
+            opts.append(o)
+    return opts
+
+
+# Telegram renders button labels fine well past this, but long labels wrap and
+# become unreadable; when truncated, the full text is shown in the message body.
+_BTN_LABEL_MAX = 55
+
+
+async def _question_bridge(question: str, options) -> str:
     loop = asyncio.get_event_loop()
     fut = loop.create_future()
     qid = _key(f"q-{len(PENDING_Q)}-{time.time()}")
-    opts = [o.strip() for o in options.split(",") if o.strip()] if options else []
+    opts = _normalize_options(options)
     PENDING_Q[qid] = {"future": fut, "options": opts}
-    btns = [[InlineKeyboardButton(o[:60], callback_data=f"qa:{qid}:{i}")]
-            for i, o in enumerate(opts)]
+
+    # One button per option, numbered so look-alikes (and truncated labels) stay
+    # distinguishable. Any option too long for its label gets spelled out in full
+    # in the message body, keyed by the same number.
+    btns = []
+    long_lines = []
+    for i, o in enumerate(opts):
+        n = i + 1
+        if len(o) > _BTN_LABEL_MAX:
+            label = f"{n}. {o[:_BTN_LABEL_MAX - 1]}…"
+            long_lines.append(f"{n}. {o}")
+        else:
+            label = f"{n}. {o}"
+        btns.append([InlineKeyboardButton(label, callback_data=f"qa:{qid}:{i}")])
     btns.append([InlineKeyboardButton("✏️ Responder por texto", callback_data=f"qc:{qid}")])
+
     # Plain-text context prefix (the question itself is sent as plain text to
     # avoid markdown breakage), so you know which session is asking.
     ctx = CURRENT_CTX.get()
@@ -1719,8 +1757,10 @@ async def _question_bridge(question: str, options: str) -> str:
     if ctx and ctx.get("directory"):
         proj = Path(ctx["directory"]).name
         prefix = f"❓ [{proj} · {ctx.get('model') or cc.DEFAULT_MODEL}]\n"
-    await _safe_send(f"{prefix}❓ {question}" if prefix else f"❓ {question}",
-                     parse_mode=None, reply_markup=InlineKeyboardMarkup(btns))
+    body = f"{prefix}❓ {question}" if prefix else f"❓ {question}"
+    if long_lines:
+        body += "\n\n" + "\n".join(long_lines)
+    await _safe_send(body, parse_mode=None, reply_markup=InlineKeyboardMarkup(btns))
     try:
         return await asyncio.wait_for(fut, timeout=900)
     except asyncio.TimeoutError:

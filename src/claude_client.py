@@ -66,14 +66,31 @@ def set_question_bridge(fn) -> None:
 
 @tool(
     "ask_user",
-    "Ask the human operator a question and wait for their answer. Use this when "
-    "you need a decision or clarification before continuing. 'options' is an "
-    "optional comma-separated list of suggested answers shown as buttons.",
-    {"question": str, "options": str},
+    "Ask the human operator a single question and wait for their answer. Use this "
+    "when you need a decision or clarification before continuing. 'options' is an "
+    "optional ARRAY of suggested answers, each shown as its own button — pass each "
+    "complete answer as one array element (do NOT join them into a single string; "
+    "commas inside an answer are fine because it is one element).",
+    {
+        "type": "object",
+        "properties": {
+            "question": {
+                "type": "string",
+                "description": "The single question to ask the operator.",
+            },
+            "options": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Optional suggested answers; each element becomes one "
+                               "button. Keep them short and mutually exclusive.",
+            },
+        },
+        "required": ["question"],
+    },
 )
 async def _ask_user(args: dict) -> dict:
     question = args.get("question", "")
-    options = args.get("options", "")
+    options = args.get("options", [])
     if _QUESTION_BRIDGE is None:
         return {"content": [{"type": "text", "text": "(no hay interfaz para preguntar)"}]}
     try:
@@ -97,9 +114,13 @@ ASK_USER_GUIDANCE = (
     "cambie el resultado (qué archivo, qué enfoque, datos que faltan, una acción "
     "destructiva o irreversible), DEBES preguntar usando la herramienta "
     "`mcp__bot__ask_user` y esperar la respuesta, en lugar de suponer o continuar a "
-    "ciegas. Pasa la pregunta en `question` y, si aplica, una lista de respuestas "
-    "sugeridas separadas por comas en `options`. No abuses: para tareas claras y sin "
-    "ambigüedad, trabaja directamente sin preguntar. Responde siempre en español."
+    "ciegas. Haz UNA sola pregunta por llamada (consolida; no encadenes varias "
+    "llamadas seguidas). Pasa la pregunta en `question` y, si aplica, las respuestas "
+    "sugeridas en `options` como un ARRAY donde cada elemento es una respuesta "
+    "completa (p.ej. [\"Sí, crea el archivo\", \"No, mejor aborta\"]); las opciones "
+    "deben ser pocas, breves y mutuamente excluyentes, sin repetir. No abuses: para "
+    "tareas claras y sin ambigüedad, trabaja directamente sin preguntar. Responde "
+    "siempre en español."
 )
 
 
