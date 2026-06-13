@@ -15,6 +15,7 @@ import time
 import shutil
 import asyncio
 import logging
+import itertools
 import contextvars
 from pathlib import Path
 from collections import deque
@@ -64,6 +65,10 @@ QUEUES: dict = {}          # skey -> deque[{"text","directory","model"}]
 MSG2SESS: dict = {}        # bot message_id -> {"skey","directory"}
 KNOWN_SID: dict = {}       # skey -> real claude session id once known
 KEYSTORE: dict = {}        # int -> str   (compress long strings for callback_data)
+KEYSTORE_REV: dict = {}    # str -> int   (inverse index for O(1) _key lookups)
+# Ephemeral counter for perm/question ids — NOT persisted; these ids are only
+# resolved in-memory via PENDING_PERMS/PENDING_Q, so no keystore entry needed.
+_EPHEMERAL_QID = itertools.count(1)
 PENDING_PERMS: dict = {}   # qid -> asyncio.Future
 PENDING_Q: dict = {}       # qid -> {"future", "options": [str]}
 LAST_EDITED: dict = {}     # skey -> {relpath: icon}  (files from most recent run)
@@ -82,7 +87,10 @@ CURRENT_CTX: contextvars.ContextVar = contextvars.ContextVar("current_ctx", defa
 STATUS_INTERVAL = 10
 STATUS_THROTTLE = 3
 MSG_TRACK_LIMIT = 200
-MD_FILE_THRESHOLD = 6000
+# Cualquier respuesta que no quepa en un solo mensaje de Telegram (~4096) se
+# manda como respuesta.md en vez de trocearse en varios. El corte va por debajo
+# del límite duro para dejar margen a la cabecera + el escapado de MarkdownV2.
+MD_FILE_THRESHOLD = 3500
 PENDING_FLOW_TTL = 300  # s — after this, a stale mkdir/question flow is ignored
 
 
@@ -99,11 +107,12 @@ def admin_only(func):
 
 
 def _key(value: str) -> int:
-    for k, v in KEYSTORE.items():
-        if v == value:
-            return k
+    k = KEYSTORE_REV.get(value)
+    if k is not None:
+        return k
     k = (max(KEYSTORE) + 1) if KEYSTORE else 0
     KEYSTORE[k] = value
+    KEYSTORE_REV[value] = k
     try:
         db.keystore_put(k, value)
     except Exception as exc:  # noqa: BLE001
@@ -205,6 +214,22 @@ def _ctx_pct(tokens_input: int, model: str | None = None) -> tuple[str, int]:
 def _model_label(model: str) -> str:
     """Human-friendly label for a model alias in picker buttons."""
     return cc.MODEL_LABELS.get(model, model)
+
+
+def _model_rows(cb_for_model, current: str | None = None) -> list:
+    """Build one button row per model in cc.MODELS.
+    cb_for_model(m) → callback_data string.
+    If current is given, the matching model gets '✅ ' prefix; others get '🧩 '.
+    If current is None, all get '🧩 '."""
+    rows = []
+    for m in cc.MODELS:
+        if current is not None:
+            prefix = "✅ " if m == current else "🧩 "
+        else:
+            prefix = "🧩 "
+        rows.append([InlineKeyboardButton(prefix + _model_label(m),
+                                          callback_data=cb_for_model(m))])
+    return rows
 
 
 def _session_card(s, meta: dict | None, cwd: str) -> str:
@@ -862,7 +887,7 @@ async def _show_session_picker(q, cwd: str, sessions: list, mode: str = "activat
         title = f"📤 `{Path(cwd).name}` — {len(sessions)} sesión(es) (destino)"
         sel = lambda sid: f"sendsess:{_key(sid)}:{pk}"
         dele = lambda sid: f"senddel:{_key(sid)}:{pk}"
-    elif mode == "sessions":
+    else:  # "sessions" (from /sessions) or "activate" (from /open)
         new_cb = f"newsess:{pk}"
         cur_sid = (db.get_active() or {}).get("claude_session_id")
         title = f"📂 `{Path(cwd).name}` — {len(sessions)} sesión(es)"
@@ -871,17 +896,8 @@ async def _show_session_picker(q, cwd: str, sessions: list, mode: str = "activat
             if active_s:
                 title += f"\n✅ {_session_label(active_s).replace('`', chr(39))[:50]}"
         sel = lambda sid: f"actsess:{_key(sid)}:{pk}"
-        dele = lambda sid: f"delsess:{_key(sid)}:{pk}:s"  # :s → re-render in sessions mode
-    else:  # activate (from /open)
-        new_cb = f"newsess:{pk}"
-        cur_sid = (db.get_active() or {}).get("claude_session_id")
-        title = f"📂 `{Path(cwd).name}` — {len(sessions)} sesión(es)"
-        if cur_sid:
-            active_s = _find_session(cur_sid, cwd)
-            if active_s:
-                title += f"\n✅ {_session_label(active_s).replace('`', chr(39))[:50]}"
-        sel = lambda sid: f"actsess:{_key(sid)}:{pk}"
-        dele = lambda sid: f"delsess:{_key(sid)}:{pk}"
+        # :s suffix tells cb_delsess to re-render in sessions mode after delete
+        dele = (lambda sid: f"delsess:{_key(sid)}:{pk}:s") if mode == "sessions" else (lambda sid: f"delsess:{_key(sid)}:{pk}")
     btns = [[InlineKeyboardButton("➕ Nueva sesión", callback_data=new_cb)]]
     for s in sessions[:10]:
         sid = s.session_id
@@ -903,8 +919,7 @@ async def _show_session_picker(q, cwd: str, sessions: list, mode: str = "activat
 
 async def _show_model_picker(q, cwd: str | None):
     pk = _key(cwd) if cwd else -1
-    btns = [[InlineKeyboardButton("🧩 " + _model_label(m), callback_data=f"setmodel:{pk}:{_key(m)}")]
-            for m in cc.MODELS]
+    btns = _model_rows(lambda m: f"setmodel:{pk}:{_key(m)}")
     btns.append([InlineKeyboardButton("❌ Cancelar", callback_data="cancel:")])
     header = f"📂 `{Path(cwd).name}`\n" if cwd else ""
     await q.edit_message_text(f"{header}🧩 Elige modelo:",
@@ -1002,6 +1017,7 @@ async def cb_delsess(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await q.edit_message_text(f"❌ Error: {exc}")
         return
     db.forget_session(sid)
+    KNOWN_SID.pop(sid, None)  # purge mapping for this materialized session
     active = db.get_active()
     if active and active.get("claude_session_id") == sid:
         db.clear_active()
@@ -1029,7 +1045,7 @@ async def cb_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 # --------------------------------------------------------------------------- #
-# /sessions /projects /close
+# /sessions /close
 # --------------------------------------------------------------------------- #
 def _group_by_dir(sessions: list) -> dict:
     by_dir: dict[str, list] = {}
@@ -1038,6 +1054,19 @@ def _group_by_dir(sessions: list) -> dict:
         if d:
             by_dir.setdefault(d, []).append(s)
     return by_dir
+
+
+def _project_picker_rows(by_dir: dict, cb_prefix: str, mark_active: bool = False) -> list:
+    """Build button rows for a project picker (one row per project, sorted).
+    Does NOT include the Cancel row — each call site appends it as needed."""
+    active_dir = (db.get_active() or {}).get("directory", "") if mark_active else ""
+    rows = []
+    for d in sorted(by_dir):
+        mark = " ✅" if (mark_active and d == active_dir) else ""
+        rows.append([InlineKeyboardButton(
+            f"📂 {Path(d).name}{mark} ({len(by_dir[d])})",
+            callback_data=f"{cb_prefix}:{_key(d)}")])
+    return rows
 
 
 @admin_only
@@ -1058,12 +1087,7 @@ async def cmd_sessions(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         dir_name = Path(active_dir).name.replace("`", "'")
         header = f"✅ Activa: `{dir_name}` › {label}\n\n"
 
-    btns = []
-    for d in sorted(by_dir):
-        mark = " ✅" if d == active_dir else ""
-        btns.append([InlineKeyboardButton(
-            f"📂 {Path(d).name}{mark} ({len(by_dir[d])})",
-            callback_data=f"sesspick:{_key(d)}")])
+    btns = _project_picker_rows(by_dir, "sesspick", mark_active=True)
     btns.append([InlineKeyboardButton("❌ Cancelar", callback_data="cancel:")])
     await update.message.reply_text(
         f"{header}¿De qué proyecto?",
@@ -1092,9 +1116,7 @@ async def cmd_close(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not by_dir:
         await update.message.reply_text("No hay proyectos con sesiones.")
         return
-    btns = [[InlineKeyboardButton(f"📂 {Path(d).name} ({len(by_dir[d])})",
-                                  callback_data=f"closedir:{_key(d)}")]
-            for d in sorted(by_dir)]
+    btns = _project_picker_rows(by_dir, "closedir")
     btns.append([InlineKeyboardButton("❌ Cancelar", callback_data="cancel:")])
     await update.message.reply_text("¿Qué proyecto cierro (borra sus sesiones)?",
                                     reply_markup=InlineKeyboardMarkup(btns))
@@ -1120,6 +1142,7 @@ async def cb_closedir(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         try:
             sdk.delete_session(s.session_id, directory=cwd)
             db.forget_session(s.session_id)
+            KNOWN_SID.pop(s.session_id, None)
             deleted += 1
         except Exception:  # noqa: BLE001
             pass
@@ -1143,9 +1166,7 @@ async def cmd_models(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⚠️ No hay sesión activa. Usa /open.")
         return
     cur = active.get("model") or cc.DEFAULT_MODEL
-    btns = [[InlineKeyboardButton(("✅ " if m == cur else "🧩 ") + _model_label(m),
-                                  callback_data=f"setmodel:-1:{_key(m)}")]
-            for m in cc.MODELS]
+    btns = _model_rows(lambda m: f"setmodel:-1:{_key(m)}", current=cur)
     btns.append([InlineKeyboardButton("🔄 Actualizar modelos", callback_data="refreshmodels:")])
     btns.append([InlineKeyboardButton("❌ Cancelar", callback_data="cancel:")])
     await update.message.reply_text(f"🧩 Modelo actual: `{_model_label(cur)}`\nElige:",
@@ -1173,9 +1194,7 @@ async def cb_refreshmodels(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ok = await asyncio.to_thread(cc.refresh_catalog, True)
     active = db.get_active()
     cur = (active.get("model") if active else None) or cc.DEFAULT_MODEL
-    btns = [[InlineKeyboardButton(("✅ " if m == cur else "🧩 ") + _model_label(m),
-                                  callback_data=f"setmodel:-1:{_key(m)}")]
-            for m in cc.MODELS]
+    btns = _model_rows(lambda m: f"setmodel:-1:{_key(m)}", current=cur)
     btns.append([InlineKeyboardButton("🔄 Actualizar modelos", callback_data="refreshmodels:")])
     btns.append([InlineKeyboardButton("❌ Cancelar", callback_data="cancel:")])
     note = "" if ok else "\n⚠️ _Catálogo en vivo no disponible — usando caché/fallback_"
@@ -1215,7 +1234,7 @@ async def cmd_esfuerzo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     model = active.get("model") or cc.DEFAULT_MODEL
     cur_effort = active.get("effort")
     fam = _family_of_alias(model)
-    levels = _effort_levels = _EFFORT_LEVELS.get(fam, []) if fam else []
+    levels = _EFFORT_LEVELS.get(fam, []) if fam else []
     if not levels:
         await update.message.reply_text(
             f"⚡ El modelo `{model}` (haiku) no tiene nivel de esfuerzo configurable.",
@@ -1239,10 +1258,6 @@ async def cb_seteffort(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
     effort = q.data.split(":")[1]
-    valid = {"low", "medium", "high", "xhigh", "max"}
-    if effort not in valid:
-        await q.edit_message_text("⚠️ Nivel no válido.")
-        return
     active = db.get_active()
     if not active:
         await q.edit_message_text("⚠️ No hay sesión activa. Usa /open.")
@@ -1267,7 +1282,6 @@ async def cb_seteffort(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         parse_mode="Markdown")
 
 
-@admin_only
 async def _apply_rename(update: Update, sid: str, cwd: str, model: str | None, title: str):
     title = title[:60]
     db.set_session_title(sid, title)
@@ -1515,6 +1529,28 @@ async def cmd_cambios(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 # --------------------------------------------------------------------------- #
 # /undo /redo /status
 # --------------------------------------------------------------------------- #
+async def _do_undo(directory: str, skey: str, reply) -> None:
+    """Ejecuta el restore real. `reply` es callable para enviar/editar el mensaje final."""
+    stack = UNDO_STACK.get(directory) or []
+    if not stack:
+        await reply("↩️ No hay nada que deshacer.")
+        return
+    cur = await asyncio.to_thread(gitops.snapshot, directory)
+    target = stack.pop()
+    ok, err = await asyncio.to_thread(gitops.restore, directory, target)
+    if not ok:
+        stack.append(target)
+        await reply(f"❌ No se pudo deshacer: {err}")
+        return
+    if cur:
+        REDO_STACK.setdefault(directory, []).append(cur)
+    LAST_EDITED.pop(skey, None)
+    await reply(
+        f"↩️ Deshecho. Quedan {len(stack)} paso(s) para deshacer, "
+        f"{len(REDO_STACK.get(directory, []))} para rehacer.\n"
+        "Usa /status para ver el estado o /redo para rehacer.")
+
+
 @admin_only
 async def cmd_undo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     active = db.get_active()
@@ -1533,20 +1569,51 @@ async def cmd_undo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not stack:
         await update.message.reply_text("↩️ No hay nada que deshacer.")
         return
-    cur = await asyncio.to_thread(gitops.snapshot, directory)
-    target = stack.pop()
-    ok, err = await asyncio.to_thread(gitops.restore, directory, target)
-    if not ok:
-        stack.append(target)
-        await update.message.reply_text(f"❌ No se pudo deshacer: {err}")
+    extra = await asyncio.to_thread(gitops.untracked_to_clean, directory)
+    if extra:
+        # Hay archivos no rastreados que el restore borraría; pedir confirmación.
+        LIMIT = 15
+        shown = extra[:LIMIT]
+        lines = ["⚠️ *¿Deshacer?* Los siguientes archivos no rastreados serán *borrados*:"]
+        for p in shown:
+            lines.append(f"  • `{p}`")
+        if len(extra) > LIMIT:
+            lines.append(f"  … y {len(extra) - LIMIT} más")
+        lines.append("\n¿Continuar con /undo?")
+        kbd = InlineKeyboardMarkup([
+            [InlineKeyboardButton("✅ Sí, deshacer (borra esos archivos)",
+                                  callback_data=f"undoyes:{_key(directory)}")],
+            [InlineKeyboardButton("❌ Cancelar", callback_data="cancel:")],
+        ])
+        await update.message.reply_text(
+            "\n".join(lines), parse_mode="Markdown", reply_markup=kbd)
         return
-    if cur:
-        REDO_STACK.setdefault(directory, []).append(cur)
-    LAST_EDITED.pop(skey, None)
-    await update.message.reply_text(
-        f"↩️ Deshecho. Quedan {len(stack)} paso(s) para deshacer, "
-        f"{len(REDO_STACK.get(directory, []))} para rehacer.\n"
-        "Usa /status para ver el estado o /redo para rehacer.")
+    await _do_undo(directory, skey, update.message.reply_text)
+
+
+async def cb_undo_yes(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    directory = _val(int(q.data.split(":")[1]))
+    if not directory or directory == KEY_MISSING:
+        await _expired(q)
+        return
+    active = db.get_active()
+    if not active or not active.get("directory"):
+        await q.edit_message_text("⚠️ No hay sesión activa. Usa /open.")
+        return
+    skey = _skey(directory, active.get("claude_session_id"))
+    if skey in STATUSES:
+        await q.edit_message_text("⏳ La sesión está ocupada. Espera a que termine.")
+        return
+    if not await asyncio.to_thread(gitops.is_git_repo, directory):
+        await q.edit_message_text("⚠️ Este proyecto no es un repositorio git.")
+        return
+    stack = UNDO_STACK.get(directory) or []
+    if not stack:
+        await q.edit_message_text("↩️ No hay nada que deshacer.")
+        return
+    await _do_undo(directory, skey, q.edit_message_text)
 
 
 @admin_only
@@ -1669,7 +1736,7 @@ def _ctx_line() -> str:
 async def _can_use_tool(tool_name: str, input_data: dict, context):
     loop = asyncio.get_event_loop()
     fut = loop.create_future()
-    qid = _key(f"perm-{len(PENDING_PERMS)}-{time.time()}")
+    qid = next(_EPHEMERAL_QID)
     PENDING_PERMS[qid] = fut
     preview = str(input_data)[:120]
     btns = [
@@ -1731,7 +1798,7 @@ _BTN_LABEL_MAX = 55
 async def _question_bridge(question: str, options) -> str:
     loop = asyncio.get_event_loop()
     fut = loop.create_future()
-    qid = _key(f"q-{len(PENDING_Q)}-{time.time()}")
+    qid = next(_EPHEMERAL_QID)
     opts = _normalize_options(options)
     PENDING_Q[qid] = {"future": fut, "options": opts}
 
@@ -1805,9 +1872,7 @@ def _clear_send_mode() -> bool:
 async def cmd_multisesion(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     SEND_MODE["on"] = True
     by_dir = _group_by_dir(_list_sessions())
-    btns = [[InlineKeyboardButton(f"📂 {Path(d).name} ({len(by_dir[d])})",
-                                  callback_data=f"sendpick:{_key(d)}")]
-            for d in sorted(by_dir)]
+    btns = _project_picker_rows(by_dir, "sendpick")
     btns.append([InlineKeyboardButton("❌ Cancelar", callback_data="cancel:")])
     await update.message.reply_text(
         "🔀 *Modo multisesión activo* — preguntaré el destino en *cada* mensaje "
@@ -1830,9 +1895,7 @@ async def cmd_send(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         SEND_MODE["oneshot"] = False
         await update.message.reply_text("No hay sesiones todavía. Usa /open.")
         return
-    btns = [[InlineKeyboardButton(f"📂 {Path(d).name} ({len(by_dir[d])})",
-                                  callback_data=f"sendpick:{_key(d)}")]
-            for d in sorted(by_dir)]
+    btns = _project_picker_rows(by_dir, "sendpick")
     btns.append([InlineKeyboardButton("❌ Cancelar", callback_data="cancel:")])
     await update.message.reply_text(
         "📤 *Envío único* — elige proyecto:",
@@ -1858,9 +1921,7 @@ async def cb_sendback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not by_dir:
         await q.edit_message_text("No hay sesiones todavía. Usa /open.")
         return
-    btns = [[InlineKeyboardButton(f"📂 {Path(d).name} ({len(by_dir[d])})",
-                                  callback_data=f"sendpick:{_key(d)}")]
-            for d in sorted(by_dir)]
+    btns = _project_picker_rows(by_dir, "sendpick")
     btns.append([InlineKeyboardButton("❌ Cancelar", callback_data="cancel:")])
     await q.edit_message_text(
         "📤 Elige proyecto:", reply_markup=InlineKeyboardMarkup(btns),
@@ -1875,13 +1936,7 @@ async def cb_sessback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not by_dir:
         await q.edit_message_text("No hay sesiones todavía. Usa /open.")
         return
-    active_dir = (db.get_active() or {}).get("directory", "")
-    btns = []
-    for d in sorted(by_dir):
-        mark = " ✅" if d == active_dir else ""
-        btns.append([InlineKeyboardButton(
-            f"📂 {Path(d).name}{mark} ({len(by_dir[d])})",
-            callback_data=f"sesspick:{_key(d)}")])
+    btns = _project_picker_rows(by_dir, "sesspick", mark_active=True)
     btns.append([InlineKeyboardButton("❌ Cancelar", callback_data="cancel:")])
     await q.edit_message_text(
         "¿De qué proyecto?", reply_markup=InlineKeyboardMarkup(btns),
@@ -1963,8 +2018,7 @@ async def cb_sendnew(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not cwd or cwd == KEY_MISSING:
         await _expired(q)
         return
-    btns = [[InlineKeyboardButton("🧩 " + _model_label(m), callback_data=f"sendmodel:{pk}:{_key(m)}")]
-            for m in cc.MODELS]
+    btns = _model_rows(lambda m, _pk=pk: f"sendmodel:{_pk}:{_key(m)}")
     btns.append([InlineKeyboardButton("❌ Cancelar", callback_data="cancel:")])
     await q.edit_message_text(
         f"📤 `{Path(cwd).name}` — nueva sesión\n🧩 Elige modelo:",
@@ -2009,6 +2063,7 @@ async def cb_senddel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await q.edit_message_text(f"❌ Error: {exc}")
         return
     db.forget_session(sid)
+    KNOWN_SID.pop(sid, None)  # purge mapping for this materialized session
     if (SEND_MODE.get("target") or {}).get("skey") == sid:
         SEND_MODE["target"] = None
     await _show_session_picker(q, cwd, _list_sessions(directory=cwd), mode="send")
@@ -2192,6 +2247,12 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         meta = db.get_session_meta(_resume_for(skey) or "")
         model = (meta or {}).get("model") or _active_model()
         effort = (meta or {}).get("effort")
+    elif reply and reply.from_user and reply.from_user.is_bot and reply.message_id not in MSG2SESS:
+        # Reply to a bot message whose tracking expired (MSG2SESS limit = 200).
+        await update.message.reply_text(
+            "⚠️ No sé a qué sesión pertenece ese mensaje (probablemente caducó el seguimiento). "
+            "Reenvía el texto sin responder, o elige la sesión con /sessions.")
+        return
     elif SEND_MODE["on"] and SEND_MODE["target"] is None:
         SEND_MODE["pending_text"] = text
         await cmd_multisesion(update, ctx)
@@ -2221,7 +2282,7 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 # --------------------------------------------------------------------------- #
 HELP = (
     "*claude-bot* — Claude Code por Telegram\n\n"
-    "/open — navegar carpetas, abrir proyecto / sesión\n"
+    "/open — explorar carpetas y abrir/crear sesión\n"
     "/sessions — gestionar sesiones de un proyecto\n"
     "/models — cambiar modelo (fable-5/opus/sonnet/haiku)\n"
     "/refreshmodels — actualizar el catálogo de modelos\n"
@@ -2346,9 +2407,10 @@ async def on_error(update: object, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 def main():
-    global APP, KEYSTORE
+    global APP, KEYSTORE, KEYSTORE_REV
     db.init()
     KEYSTORE = db.load_keystore()  # restore so pre-restart buttons still resolve
+    KEYSTORE_REV = {v: k for k, v in KEYSTORE.items()}
     cc.set_question_bridge(_question_bridge)
 
     asyncio.set_event_loop(asyncio.new_event_loop())  # Python 3.14 fix
@@ -2403,6 +2465,7 @@ def main():
     app.add_handler(CallbackQueryHandler(cb_senddel, pattern=r"^senddel:"))
     app.add_handler(CallbackQueryHandler(cb_abort, pattern=r"^abort:"))
     app.add_handler(CallbackQueryHandler(cb_commitpush, pattern=r"^commitpush:"))
+    app.add_handler(CallbackQueryHandler(cb_undo_yes, pattern=r"^undoyes:"))
     app.add_handler(CallbackQueryHandler(cb_cancel, pattern=r"^cancel:"))
 
     app.add_handler(MessageHandler(filters.Document.ALL | filters.PHOTO | filters.VIDEO, handle_file))
@@ -2420,9 +2483,8 @@ def main():
 
         await application.bot.set_my_commands([
             BotCommand("start", "Estado y menú"),
-            BotCommand("open", "Abrir proyecto / sesión"),
+            BotCommand("open", "Explorar carpetas y abrir/crear sesión"),
             BotCommand("sessions", "Gestionar sesiones"),
-            BotCommand("projects", "Proyectos con sesiones"),
             BotCommand("models", "Cambiar modelo"),
             BotCommand("refreshmodels", "Actualizar catálogo de modelos"),
             BotCommand("esfuerzo", "Nivel de esfuerzo (low/medium/high/xhigh/max)"),

@@ -211,6 +211,20 @@ def snapshot(directory: str) -> str | None:
                 pass
 
 
+def untracked_to_clean(directory: str) -> list[str]:
+    """Rutas untracked que un `git clean -fd` borraría (dry-run, respeta .gitignore).
+    Lista vacía si no hay ninguna o si algo falla."""
+    try:
+        out = _run(["git", "clean", "-nd"], cwd=directory)
+    except (GitError, subprocess.TimeoutExpired, OSError):
+        return []
+    paths = []
+    for line in out.splitlines():
+        if line.startswith("Would remove "):
+            paths.append(line[len("Would remove "):].strip())
+    return paths
+
+
 def restore(directory: str, sha: str) -> tuple[bool, str]:
     """Restore the working tree to the state captured in snapshot sha.
     Does NOT move HEAD or alter commit history."""

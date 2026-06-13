@@ -19,7 +19,7 @@ cp .env.example .env            # fill TELEGRAM_BOT_TOKEN + TELEGRAM_ADMIN_ID
 ./run.sh                         # = .venv/bin/python src/telegram_bot.py
 
 # Syntax check before deploying (there is NO test suite, NO linter configured)
-.venv/bin/python -m py_compile src/telegram_bot.py src/claude_client.py src/db.py
+.venv/bin/python -m py_compile src/*.py
 ```
 
 The bot runs in production as a **systemd *user* service** (`claude-bot.service`,
@@ -37,7 +37,7 @@ venv python from inside `src/` so imports resolve, e.g.
 
 ## Architecture
 
-Three layers, each requiring the others for context:
+Three core layers, each requiring the others for context:
 
 - **`src/telegram_bot.py`** — all Telegram I/O, commands, callbacks, live status,
   message routing. Holds the app together via module-level global dicts (single
@@ -45,14 +45,30 @@ Three layers, each requiring the others for context:
 - **`src/claude_client.py`** — thin Agent SDK wrapper. `run()` is an async
   generator yielding **normalized events** (`session`/`text`/`thinking`/`tool`/
   `usage`/`result`/`error`) that the bot renders. Also defines the `ask_user` MCP
-  tool and `ask_side()` (see `/btw` below).
+  tool and `ask_side()` (see `/btw` below). Per-session **effort** (`/esfuerzo`,
+  stored in `db` on both `active.effort` and `session_meta.effort`) is forwarded to
+  the SDK as the `effort` kwarg; Haiku has no configurable effort.
 - **`src/db.py`** — SQLite (`bot.db`). Stores the active-session pointer,
-  per-session metadata (model, custom title), a **persisted callback keystore**
+  per-session metadata (model, custom title, effort), a **persisted callback keystore**
   (`keystore` table — so inline buttons survive restarts) and an **in-flight task
   ledger** (`inflight` table — for orphan detection after a restart). The real
   conversation history is persisted on disk by Claude itself; session discovery
   uses the SDK's native `list_sessions()` / `resume=` / `delete_session()`. Do not
   try to duplicate conversation state here. Connections use WAL + `busy_timeout`.
+
+Plus supporting modules that carry real architectural weight:
+
+- **`src/models_catalog.py`** — the **single source of truth** for the model picker.
+  Calls Anthropic's `/v1/models` reusing the OAuth bearer the `claude` CLI already
+  keeps in `~/.claude/.credentials.json` (no extra API key, no extra payment), keeps
+  the newest entry per family (opus/sonnet/haiku/fable), and **caches the result in
+  `db`** so the picker reflects what the current plan actually serves. `claude_client`
+  re-exports its surface (`MODELS`, `DEFAULT_MODEL`, `cli_model()`, …); `/refreshmodels`
+  (and the refresh button in `/models`) call `refresh()`.
+- **`src/gitops.py`** — sync, subprocess-only git helpers (no deps) backing `/undo`,
+  `/redo`, `/status`. See the snapshot/undo gotcha below.
+- **`src/md2tgv2.py`** (Markdown→MarkdownV2) and **`src/transcription.py`** (Grok
+  voice-note STT) are leaf utilities.
 
 ### Session model — the `skey` concept (central, easy to get wrong)
 
@@ -134,9 +150,24 @@ are awaited Futures resolved by callback handlers.
   The actual restart is launched **detached** via `systemd-run … --collect` so it
   survives our SIGTERM. If neither mode is reachable it explains the options
   instead of failing silently.
-- Final replies > `MD_FILE_THRESHOLD` (~6000 chars) are sent as a `respuesta.md`
-  document; otherwise chunked. All markdown goes through `md2tgv2.convert()` →
-  MarkdownV2, with a plain-text fallback on `BadRequest`.
+- Final replies that don't fit in a single Telegram message (> `MD_FILE_THRESHOLD`,
+  ~3500 chars to leave room for the header + MarkdownV2 escaping) are sent as a
+  `respuesta.md` document instead of being split across messages. Shorter replies
+  go inline. All markdown goes through `md2tgv2.convert()` → MarkdownV2, with a
+  plain-text fallback on `BadRequest`.
+- **`/undo` · `/redo` · `/status`** (`gitops.py`): before each task that edits files,
+  `_run_task` captures a `pre_snapshot` of the working tree via `git commit-tree` on a
+  **throwaway index** (`GIT_INDEX_FILE`) — it never touches the real HEAD, index, or
+  history, and keeps the object alive under `refs/bot-snapshots/`. `_finish` pushes that
+  snapshot onto `UNDO_STACK[directory]` (capped at 50; a new task clears `REDO_STACK`).
+  `/undo` restores via `read-tree` + `checkout-index -f -a` + `clean -fd`, moving the
+  state across `UNDO_STACK`/`REDO_STACK`. `/status` shows the diff summary with a
+  "Commit y push" button → `commit_push()` (commit is the critical step; a push with no
+  remote / no upstream still reports success since the work is safely committed).
+- **`ask_user` options is an ARRAY** (`claude_client` tool schema), never a CSV string —
+  each element is exactly one button, so commas inside an answer don't shatter it.
+  `_question_bridge` normalizes (still accepts a legacy comma-string), de-dups, and
+  numbers buttons; long options are spelled out in full in the message body.
 
 ## Config (`.env`)
 
