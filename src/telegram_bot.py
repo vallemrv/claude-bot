@@ -1131,10 +1131,46 @@ async def cmd_models(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     btns = [[InlineKeyboardButton(("✅ " if m == cur else "🧩 ") + _model_label(m),
                                   callback_data=f"setmodel:-1:{_key(m)}")]
             for m in cc.MODELS]
+    btns.append([InlineKeyboardButton("🔄 Actualizar modelos", callback_data="refreshmodels:")])
     btns.append([InlineKeyboardButton("❌ Cancelar", callback_data="cancel:")])
     await update.message.reply_text(f"🧩 Modelo actual: `{_model_label(cur)}`\nElige:",
                                     reply_markup=InlineKeyboardMarkup(btns),
                                     parse_mode="Markdown")
+
+
+@admin_only
+async def cmd_refreshmodels(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    msg = await update.message.reply_text("🔄 Actualizando catálogo de modelos…")
+    ok = await asyncio.to_thread(cc.refresh_catalog, True)
+    lines = ["✅ *Modelos actualizados*" if ok
+             else "⚠️ *No se pudo obtener el catálogo en vivo — usando caché/fallback*"]
+    for m in cc.MODELS:
+        lines.append(f"• `{m}` — {_model_label(m)}")
+    try:
+        await msg.edit_text("\n".join(lines), parse_mode="Markdown")
+    except BadRequest:
+        await msg.edit_text("\n".join(lines))
+
+
+async def cb_refreshmodels(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer("Actualizando…")
+    ok = await asyncio.to_thread(cc.refresh_catalog, True)
+    active = db.get_active()
+    cur = (active.get("model") if active else None) or cc.DEFAULT_MODEL
+    btns = [[InlineKeyboardButton(("✅ " if m == cur else "🧩 ") + _model_label(m),
+                                  callback_data=f"setmodel:-1:{_key(m)}")]
+            for m in cc.MODELS]
+    btns.append([InlineKeyboardButton("🔄 Actualizar modelos", callback_data="refreshmodels:")])
+    btns.append([InlineKeyboardButton("❌ Cancelar", callback_data="cancel:")])
+    note = "" if ok else "\n⚠️ _Catálogo en vivo no disponible — usando caché/fallback_"
+    try:
+        await q.edit_message_text(
+            f"🧩 Modelo actual: `{_model_label(cur)}`\nElige:{note}",
+            reply_markup=InlineKeyboardMarkup(btns),
+            parse_mode="Markdown")
+    except BadRequest:
+        pass
 
 
 # Effort levels per model family. Haiku has no configurable effort.
@@ -1328,6 +1364,20 @@ async def cmd_btw(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     PENDING_INPUT.update({"kind": "btw", "sid": sid, "directory": directory,
                           "model": model, "msg_id": msg.message_id,
                           "ts": time.time()})
+
+
+@admin_only
+async def cmd_init(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Despacha '/init' a la sesión activa (lanza el /init built-in de Claude Code)."""
+    active = db.get_active()
+    if not active or not active.get("directory"):
+        await update.message.reply_text(
+            "⚠️ No hay sesión activa. Usa /open para abrir un proyecto primero.")
+        return
+    directory = active["directory"]
+    skey = _skey(directory, active.get("claude_session_id"))
+    model = active.get("model") or cc.DEFAULT_MODEL
+    await _dispatch(directory, skey, model, "/init", active.get("effort"))
 
 
 PERM_MODES = ["bypassPermissions", "acceptEdits", "default", "plan"]
@@ -1971,7 +2021,9 @@ HELP = (
     "/open — navegar carpetas, abrir proyecto / sesión\n"
     "/sessions — gestionar sesiones de un proyecto\n"
     "/models — cambiar modelo (fable-5/opus/sonnet/haiku)\n"
+    "/refreshmodels — actualizar el catálogo de modelos\n"
     "/esfuerzo — nivel de esfuerzo/razonamiento (low/medium/high/xhigh/max)\n"
+    "/init — inicializar CLAUDE.md del proyecto (bypass a /init de Claude Code)\n"
     "/rename — renombrar la sesión activa (`/rename mi nombre`)\n"
     "/btw — pregunta rápida sobre la sesión, sin tocar su historial\n"
     "/cambios — archivos modificados en la última ejecución\n"
@@ -2108,7 +2160,9 @@ def main():
     app.add_handler(CommandHandler("sessions", cmd_sessions))
     app.add_handler(CommandHandler("close", cmd_close))
     app.add_handler(CommandHandler("models", cmd_models))
+    app.add_handler(CommandHandler("refreshmodels", cmd_refreshmodels))
     app.add_handler(CommandHandler("esfuerzo", cmd_esfuerzo))
+    app.add_handler(CommandHandler("init", cmd_init))
     app.add_handler(CommandHandler("rename", cmd_rename))
     app.add_handler(CommandHandler("btw", cmd_btw))
     app.add_handler(CommandHandler("cambios", cmd_cambios))
@@ -2124,6 +2178,7 @@ def main():
     app.add_handler(CallbackQueryHandler(cb_os, pattern=r"^os:"))
     app.add_handler(CallbackQueryHandler(cb_newsess, pattern=r"^newsess:"))
     app.add_handler(CallbackQueryHandler(cb_setmodel, pattern=r"^setmodel:"))
+    app.add_handler(CallbackQueryHandler(cb_refreshmodels, pattern=r"^refreshmodels:"))
     app.add_handler(CallbackQueryHandler(cb_seteffort, pattern=r"^seteffort:"))
     app.add_handler(CallbackQueryHandler(cb_actsess, pattern=r"^actsess:"))
     app.add_handler(CallbackQueryHandler(cb_delsess, pattern=r"^delsess:"))
@@ -2162,7 +2217,9 @@ def main():
             BotCommand("sessions", "Gestionar sesiones"),
             BotCommand("projects", "Proyectos con sesiones"),
             BotCommand("models", "Cambiar modelo"),
+            BotCommand("refreshmodels", "Actualizar catálogo de modelos"),
             BotCommand("esfuerzo", "Nivel de esfuerzo (low/medium/high/xhigh/max)"),
+            BotCommand("init", "Inicializar CLAUDE.md del proyecto"),
             BotCommand("rename", "Renombrar sesión activa"),
             BotCommand("btw", "Pregunta rápida (no afecta historial)"),
             BotCommand("cambios", "Archivos modificados en la última ejecución"),
