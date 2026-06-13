@@ -376,6 +376,39 @@ def _active_model() -> str:
 # --------------------------------------------------------------------------- #
 # Live status (fed by the SDK stream)
 # --------------------------------------------------------------------------- #
+# Field that best summarizes each tool's action in the live status line.
+_TOOL_ARG_FIELDS = {
+    "Bash": "command", "Read": "file_path", "Write": "file_path",
+    "Edit": "file_path", "MultiEdit": "file_path", "NotebookEdit": "notebook_path",
+    "Glob": "pattern", "Grep": "pattern", "Task": "description",
+    "WebFetch": "url", "WebSearch": "query",
+}
+
+
+def _tool_arg(name: str, inp: dict, directory: str) -> str:
+    if not inp:
+        return ""
+    field = _TOOL_ARG_FIELDS.get(name)
+    val = inp.get(field) if field else None
+    if not val:
+        for k in ("file_path", "path", "command", "pattern", "query", "url"):
+            if inp.get(k):
+                val, field = inp[k], k
+                break
+    if not val:
+        return ""
+    val = str(val)
+    if field in ("file_path", "path", "notebook_path"):
+        try:
+            val = str(Path(val).relative_to(directory))
+        except ValueError:
+            pass
+    val = val.replace("\n", " ").strip()
+    if len(val) > 60:
+        val = val[:57] + "…"
+    return val.replace("`", "'")
+
+
 def _build_status_text(st: dict) -> str:
     icons = {"busy": "🔴", "thinking": "🤔", "idle": "🟢", "error": "❌", "pending": "⚪"}
     state = st.get("state", "busy")
@@ -404,12 +437,15 @@ def _build_status_text(st: dict) -> str:
             fs += f" +{len(files)-4}"
         lines.append(f"📝 {fs}")
     if st.get("tool"):
-        lines.append(f"🔧 `{st['tool']}`")
+        line = f"🔧 `{st['tool']}`"
+        if st.get("tool_arg"):
+            line += f": `{st['tool_arg']}`"
+        lines.append(line)
     else:
         tools = list(dict.fromkeys(st.get("tools_seen", [])))
         if tools:
             lines.append("⚡ " + " · ".join(f"`{t}`" for t in tools[-5:]))
-    if state == "thinking" and st.get("reasoning_text"):
+    if st.get("reasoning_text"):
         snip = st["reasoning_text"][-200:].replace("`", "'").replace("*", "")
         lines.append(f"💭 _{snip}_")
     tok_in = st.get("tokens_input", 0)
@@ -593,14 +629,22 @@ async def _finish(skey: str, directory: str, final: dict | None,
         await _delete_msg(APP.bot, st["msg_id"])
     if st:
         files = st.get("files_edited", {})
+        pre = st.get("pre_snapshot")
         if files:
             LAST_EDITED[skey] = dict(files)
-            pre = st.get("pre_snapshot")
             if pre:
                 UNDO_STACK.setdefault(directory, []).append(pre)
-                REDO_STACK.pop(directory, None)
-                if len(UNDO_STACK[directory]) > 50:
+                # A new edit invalidates redo; those snapshots are now unreachable.
+                for sha in REDO_STACK.pop(directory, None) or []:
+                    await asyncio.to_thread(gitops.drop_snapshot, directory, sha)
+                overflow = UNDO_STACK[directory][:-50]
+                if overflow:
+                    for sha in overflow:
+                        await asyncio.to_thread(gitops.drop_snapshot, directory, sha)
                     UNDO_STACK[directory] = UNDO_STACK[directory][-50:]
+        elif pre:
+            # Read-only task: the upfront snapshot is never used — drop its ref.
+            await asyncio.to_thread(gitops.drop_snapshot, directory, pre)
         await _send_reply(skey, directory, st, final,
                           cancelled=cancelled, error_msg=error_msg)
     await _drain_queue(skey, directory)
@@ -669,6 +713,7 @@ async def _run_task(skey: str, directory: str, prompt: str,
                 if st:
                     st["state"] = "busy"
                     st["tool"] = ev["name"]
+                    st["tool_arg"] = _tool_arg(ev["name"], ev["input"], directory)
                     if ev["name"] not in st["tools_seen"]:
                         st["tools_seen"].append(ev["name"])
                     if ev["name"] in cc.EDIT_TOOLS:
@@ -1542,6 +1587,8 @@ async def _do_undo(directory: str, skey: str, reply) -> None:
         stack.append(target)
         await reply(f"❌ No se pudo deshacer: {err}")
         return
+    # We're now AT `target`; it's off every stack, so drop its keep-ref.
+    await asyncio.to_thread(gitops.drop_snapshot, directory, target)
     if cur:
         REDO_STACK.setdefault(directory, []).append(cur)
     LAST_EDITED.pop(skey, None)
@@ -1641,6 +1688,8 @@ async def cmd_redo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         stack.append(target)
         await update.message.reply_text(f"❌ No se pudo rehacer: {err}")
         return
+    # We're now AT `target`; it's off every stack, so drop its keep-ref.
+    await asyncio.to_thread(gitops.drop_snapshot, directory, target)
     if cur:
         UNDO_STACK.setdefault(directory, []).append(cur)
     LAST_EDITED.pop(skey, None)

@@ -109,26 +109,23 @@ def repo_status(directory: str) -> dict:
     except GitError:
         pass
 
-    # Untracked files: count their lines via numstat --no-index
+    # Untracked files: count their lines via numstat --no-index.
+    # `diff --no-index` always exits non-zero when the files differ (they always
+    # do vs /dev/null), so read stdout directly instead of raising + re-running.
     for fpath in untracked_files:
         full = os.path.join(directory, fpath)
         if not os.path.isfile(full):
             continue
         try:
-            out = _run(
-                ["git", "diff", "--numstat", "--no-index", "/dev/null", fpath],
-                cwd=directory,
-            )
-        except GitError as e:
-            # diff --no-index exits 1 when files differ (always); grab stdout via
-            # re-running without raising — we need to rerun with check=False
             r2 = subprocess.run(
                 ["git", "diff", "--numstat", "--no-index", "/dev/null", fpath],
                 cwd=directory,
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                 timeout=30,
             )
-            out = r2.stdout.decode(errors="replace")
+        except (subprocess.TimeoutExpired, OSError):
+            continue
+        out = r2.stdout.decode(errors="replace")
         for line in out.splitlines():
             parts = line.split("\t", 2)
             if len(parts) == 3 and parts[0] != "-":
@@ -223,6 +220,18 @@ def untracked_to_clean(directory: str) -> list[str]:
         if line.startswith("Would remove "):
             paths.append(line[len("Would remove "):].strip())
     return paths
+
+
+def drop_snapshot(directory: str, sha: str) -> None:
+    """Delete a snapshot's keep-ref so its objects become collectable by GC.
+    Best-effort: a snapshot no longer referenced by any undo/redo stack would
+    otherwise pin its objects under refs/bot-snapshots/ forever."""
+    if not sha:
+        return
+    try:
+        _run(["git", "update-ref", "-d", f"refs/bot-snapshots/{sha}"], cwd=directory)
+    except (GitError, subprocess.TimeoutExpired, OSError):
+        pass
 
 
 def restore(directory: str, sha: str) -> tuple[bool, str]:

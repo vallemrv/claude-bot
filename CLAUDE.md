@@ -90,8 +90,11 @@ to avoid double-dispatch races), posts a status message, then launches `_run_tas
 as an `asyncio.Task`. If posting the status fails, the slot is freed (so the session
 isn't wedged "busy"). `_run_task` consumes `cc.run()` events under an
 `asyncio.wait_for(TASK_TIMEOUT)` cap (a hung CLI is interrupted, not left forever),
-updates a live status message (throttled + a `job_queue` heartbeat), and on
-completion `_finish()` deletes the status, sends the final reply, and drains the
+updates a live status message (throttled + a `job_queue` heartbeat). The status line
+for the current tool includes its key argument — `_tool_arg()` picks the salient field
+per tool (`_TOOL_ARG_FIELDS`: e.g. `command` for Bash, `file_path` for edits, made
+repo-relative, truncated) so the user sees `🔧 Edit: src/foo.py`, not a bare tool name.
+On completion `_finish()` deletes the status, sends the final reply, and drains the
 queue. `_finish` runs under `asyncio.shield` inside the `finally`, so a cancellation
 (`/esc`) can't abort the queue drain. The reply header reflects the real outcome:
 `✅` success / `❌` error (`result.is_error` + `subtype`) / `🛑` cancelled. If a `skey`
@@ -164,6 +167,12 @@ are awaited Futures resolved by callback handlers.
   state across `UNDO_STACK`/`REDO_STACK`. `/status` shows the diff summary with a
   "Commit y push" button → `commit_push()` (commit is the critical step; a push with no
   remote / no upstream still reports success since the work is safely committed).
+  Each snapshot is pinned under `refs/bot-snapshots/` so GC can't collect it while it's
+  reachable from a stack. Once a snapshot leaves every stack — a read-only task whose
+  upfront snapshot was never used, a redo entry invalidated by a new edit, the state
+  you just landed on via undo/redo, or an entry past the 50-cap — `_finish`/`_do_undo`/
+  `cmd_redo` call `gitops.drop_snapshot()` to delete its keep-ref so its objects become
+  collectable. Best-effort: dropping a ref never fails the operation.
 - **`ask_user` options is an ARRAY** (`claude_client` tool schema), never a CSV string —
   each element is exactly one button, so commas inside an answer don't shatter it.
   `_question_bridge` normalizes (still accepts a legacy comma-string), de-dups, and
