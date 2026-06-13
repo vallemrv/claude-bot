@@ -68,6 +68,7 @@ PENDING_Q: dict = {}       # qid -> {"future", "options": [str]}
 SEND_MODE = {"on": False, "target": None, "pending_text": None,
              "oneshot": False, "oneshot_pre": False}
 MKDIR_PENDING: dict = {}   # {"path","msg_id"}
+PENDING_INPUT: dict = {}   # {"kind": "rename"|"btw", "sid", "directory", "msg_id", "ts"}
 
 # Per-task context (cwd, sid, model) propagated to the permission/question
 # bridges. A ContextVar isolates this per asyncio.Task, so concurrent sessions
@@ -982,6 +983,9 @@ async def cb_delsess(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def cb_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
+    # If this Cancel belongs to a /rename or /btw prompt, clear pending input.
+    if PENDING_INPUT.get("msg_id") == q.message.message_id:
+        PENDING_INPUT.clear()
     await q.edit_message_text("❌ Cancelado.")
 
 
@@ -1110,6 +1114,14 @@ async def cmd_models(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 @admin_only
+async def _apply_rename(update: Update, sid: str, cwd: str, model: str | None, title: str):
+    title = title[:60]
+    db.set_session_title(sid, title)
+    await update.message.reply_text(
+        f"✅ *Sesión renombrada:* `{title}`\n📂 `{Path(cwd).name}` · 🧩 `{model or cc.DEFAULT_MODEL}`",
+        parse_mode="Markdown")
+
+
 async def cmd_rename(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     active = db.get_active()
     if not active:
@@ -1120,41 +1132,28 @@ async def cmd_rename(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             "⚠️ La sesión aún no existe (envía un primer prompt antes de renombrarla).")
         return
-    title = " ".join(ctx.args).strip()
-    if not title:
-        await update.message.reply_text("Uso: `/rename <nuevo nombre>`", parse_mode="Markdown")
-        return
-    title = title[:60]
-    db.set_session_title(sid, title)
     cwd = active["directory"]
-    await update.message.reply_text(
-        f"✅ *Sesión renombrada:* `{title}`\n📂 `{Path(cwd).name}` · 🧩 `{active.get('model') or cc.DEFAULT_MODEL}`",
-        parse_mode="Markdown")
+    model = active.get("model")
+    title = " ".join(ctx.args).strip()
+    if title:
+        await _apply_rename(update, sid, cwd, model, title)
+        return
+    # No argument → ask for it, store pending input.
+    meta = db.get_session_meta(sid) or {}
+    cur_title = meta.get("title") or sid[:8]
+    kbd = InlineKeyboardMarkup(
+        [[InlineKeyboardButton("❌ Cancelar", callback_data="cancel:")]])
+    msg = await update.message.reply_text(
+        f"✏️ Dime el nuevo nombre para la sesión `{cur_title}` "
+        f"de `{Path(cwd).name}`.",
+        reply_markup=kbd, parse_mode="Markdown")
+    PENDING_INPUT.clear()
+    PENDING_INPUT.update({"kind": "rename", "sid": sid, "directory": cwd,
+                          "model": model, "msg_id": msg.message_id,
+                          "ts": time.time()})
 
 
-@admin_only
-async def cmd_btw(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Side question (à la /btw): sees the active session's context, no tools,
-    doesn't touch its history (forks + deletes a throwaway session)."""
-    active = db.get_active()
-    if not active:
-        await update.message.reply_text("⚠️ No hay sesión activa. Usa /open.")
-        return
-    sid = active.get("claude_session_id")
-    if not sid:
-        await update.message.reply_text(
-            "⚠️ La sesión activa aún no tiene contexto (envía un primer prompt).")
-        return
-    question = " ".join(ctx.args).strip()
-    if not question:
-        await update.message.reply_text(
-            "Uso: `/btw <pregunta>`\nPregunta rápida sobre la sesión activa "
-            "(ve el contexto, sin herramientas, no afecta al historial).",
-            parse_mode="Markdown")
-        return
-
-    directory = active["directory"]
-    model = active.get("model") or cc.DEFAULT_MODEL
+async def _run_btw(update: Update, question: str, directory: str, sid: str, model: str):
     status = await update.message.reply_text("💬 _Pensando \\(btw\\)…_",
                                              parse_mode="MarkdownV2")
     answer = ""
@@ -1191,6 +1190,41 @@ async def cmd_btw(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await status.edit_text(chunks[0])
     for c in chunks[1:]:
         await _safe_send(md2tgv2.convert(c), plain_fallback=c)
+
+
+@admin_only
+async def cmd_btw(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Side question (à la /btw): sees the active session's context, no tools,
+    doesn't touch its history (forks + deletes a throwaway session)."""
+    active = db.get_active()
+    if not active:
+        await update.message.reply_text("⚠️ No hay sesión activa. Usa /open.")
+        return
+    sid = active.get("claude_session_id")
+    if not sid:
+        await update.message.reply_text(
+            "⚠️ La sesión activa aún no tiene contexto (envía un primer prompt).")
+        return
+    directory = active["directory"]
+    model = active.get("model") or cc.DEFAULT_MODEL
+    question = " ".join(ctx.args).strip()
+    if question:
+        await _run_btw(update, question, directory, sid, model)
+        return
+    # No argument → ask for it, store pending input.
+    meta = db.get_session_meta(sid) or {}
+    cur_title = meta.get("title") or sid[:8]
+    kbd = InlineKeyboardMarkup(
+        [[InlineKeyboardButton("❌ Cancelar", callback_data="cancel:")]])
+    msg = await update.message.reply_text(
+        f"💬 Dime tu pregunta sobre la sesión `{cur_title}` "
+        f"de `{Path(directory).name}`.\n"
+        "_Verá el contexto, sin herramientas, no afecta al historial._",
+        reply_markup=kbd, parse_mode="Markdown")
+    PENDING_INPUT.clear()
+    PENDING_INPUT.update({"kind": "btw", "sid": sid, "directory": directory,
+                          "model": model, "msg_id": msg.message_id,
+                          "ts": time.time()})
 
 
 PERM_MODES = ["bypassPermissions", "acceptEdits", "default", "plan"]
@@ -1706,6 +1740,26 @@ async def handle_audio(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 @admin_only
 async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
+
+    # Pending /rename or /btw input? (only consume plain messages, not replies.)
+    if PENDING_INPUT and not update.message.reply_to_message:
+        if time.time() - PENDING_INPUT.get("ts", 0) > PENDING_FLOW_TTL:
+            PENDING_INPUT.clear()
+        else:
+            pend = dict(PENDING_INPUT)
+            PENDING_INPUT.clear()
+            kind = pend["kind"]
+            arg = text.strip()
+            if not arg:
+                await update.message.reply_text("❌ Entrada vacía. Cancelado.")
+                return
+            if kind == "rename":
+                await _apply_rename(update, pend["sid"], pend["directory"],
+                                    pend.get("model"), arg)
+            elif kind == "btw":
+                await _run_btw(update, arg, pend["directory"], pend["sid"],
+                               pend.get("model") or cc.DEFAULT_MODEL)
+            return
 
     # Pending mkdir name?
     if MKDIR_PENDING:
