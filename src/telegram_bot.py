@@ -1784,7 +1784,7 @@ HELP = (
     "*claude-bot* — Claude Code por Telegram\n\n"
     "/open — navegar carpetas, abrir proyecto / sesión\n"
     "/sessions — gestionar sesiones de un proyecto\n"
-    "/models — cambiar modelo (opus/sonnet/haiku)\n"
+    "/models — cambiar modelo (fable-5/opus/sonnet/haiku)\n"
     "/rename — renombrar la sesión activa (`/rename mi nombre`)\n"
     "/btw — pregunta rápida sobre la sesión, sin tocar su historial\n"
     "/permisos — modo de permisos\n"
@@ -1957,6 +1957,14 @@ def main():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
     async def post_init(application: Application):
+        # Refresh the model catalog from Anthropic's /v1/models. Non-blocking
+        # for the bot: on failure we keep the cached/fallback catalog.
+        try:
+            cc.refresh_catalog()
+            logger.info("models catalog: %s", ", ".join(cc.MODELS))
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"models catalog refresh failed: {exc}")
+
         await application.bot.set_my_commands([
             BotCommand("start", "Estado y menú"),
             BotCommand("open", "Abrir proyecto / sesión"),
