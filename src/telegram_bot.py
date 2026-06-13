@@ -65,6 +65,7 @@ KNOWN_SID: dict = {}       # skey -> real claude session id once known
 KEYSTORE: dict = {}        # int -> str   (compress long strings for callback_data)
 PENDING_PERMS: dict = {}   # qid -> asyncio.Future
 PENDING_Q: dict = {}       # qid -> {"future", "options": [str]}
+LAST_EDITED: dict = {}     # skey -> {relpath: icon}  (files from most recent run)
 SEND_MODE = {"on": False, "target": None, "pending_text": None,
              "oneshot": False, "oneshot_pre": False}
 MKDIR_PENDING: dict = {}   # {"path","msg_id"}
@@ -355,19 +356,22 @@ def _build_status_text(st: dict) -> str:
               "error": "ERROR", "pending": "ESPERANDO"}
     cwd_name = Path(st.get("directory", "")).name or "?"
     model = st.get("model") or "?"
+    effort = st.get("effort")
     elapsed = _format_elapsed(time.time() - st.get("start_time", time.time()))
 
     sess_label = (st.get("session_label") or "").replace("`", "'").replace("*", "·")
     label_line = f"💬 _{sess_label[:50]}_" if sess_label else ""
+    effort_str = f" · ⚡`{effort or 'high'}`"
     lines = [
         f"{icon} *{labels.get(state, state.upper())}* | 📂 `{cwd_name}`",
-        f"🧩 `{model}` | ⏱ `{elapsed}`",
+        f"🧩 `{model}`{effort_str} | ⏱ `{elapsed}`",
     ]
     if label_line:
         lines.append(label_line)
-    files = st.get("files_edited", set())
+    files = st.get("files_edited", {})
     if files:
-        fs = ", ".join(f"`{f}`" for f in list(files)[:4])
+        items = list(files.items())[:4]
+        fs = ", ".join(f"{ico}`{rp}`" for rp, ico in items)
         if len(files) > 4:
             fs += f" +{len(files)-4}"
         lines.append(f"📝 {fs}")
@@ -427,7 +431,7 @@ def _start_status(skey: str, directory: str, msg_id: int, model: str,
     STATUSES[skey] = {
         "msg_id": msg_id, "directory": directory, "model": model,
         "session_label": session_label,
-        "state": "pending", "tool": None, "tools_seen": [], "files_edited": set(),
+        "state": "pending", "tool": None, "tools_seen": [], "files_edited": {},
         "reasoning_text": None, "start_time": time.time(),
         "last_update_time": time.time(), "tokens_input": 0, "tokens_output": 0,
         "cost": 0.0,
@@ -442,9 +446,10 @@ async def _send_reply(skey: str, directory: str, st: dict, final: dict | None,
                       cancelled: bool = False, error_msg: str | None = None):
     cwd_name = Path(directory).name or "?"
     model = st.get("model") or "?"
+    effort = st.get("effort")
     elapsed = _format_elapsed(time.time() - st.get("start_time", time.time()))
     cost = (final or {}).get("cost", 0.0)
-    files = st.get("files_edited", set())
+    files = st.get("files_edited", {})
 
     # Outcome icon — never claim success when Claude errored or was cancelled.
     is_error = bool((final or {}).get("is_error"))
@@ -463,7 +468,8 @@ async def _send_reply(skey: str, directory: str, st: dict, final: dict | None,
         session_title = (meta or {}).get("title")
 
     tok_in = st.get("tokens_input", 0)
-    header = f"{icon} `{cwd_name}` | 🧩 `{model}` | ⏱ `{elapsed}`"
+    effort_str = f" · ⚡`{effort or 'high'}`"
+    header = f"{icon} `{cwd_name}` | 🧩 `{model}`{effort_str} | ⏱ `{elapsed}`"
     if tok_in:
         ctx_str, ctx_pct = _ctx_pct(tok_in, model)
         header += f" | {ctx_str}"
@@ -485,8 +491,8 @@ async def _send_reply(skey: str, directory: str, st: dict, final: dict | None,
     if ctx_pct >= 80:
         header += "\n⚠️ _Contexto casi lleno — considera abrir una sesión nueva_"
     if files:
-        names = list(files)[:3]
-        header += " 📝 " + ", ".join(f"`{f}`" for f in names)
+        items = list(files.items())[:3]
+        header += " 📝 " + ", ".join(f"{ico}`{rp}`" for rp, ico in items)
         if len(files) > 3:
             header += f" +{len(files)-3}"
 
@@ -558,6 +564,9 @@ async def _finish(skey: str, directory: str, final: dict | None,
     if st and st.get("msg_id"):
         await _delete_msg(APP.bot, st["msg_id"])
     if st:
+        files = st.get("files_edited", {})
+        if files:
+            LAST_EDITED[skey] = dict(files)
         await _send_reply(skey, directory, st, final,
                           cancelled=cancelled, error_msg=error_msg)
     await _drain_queue(skey, directory)
@@ -570,15 +579,21 @@ async def _drain_queue(skey: str, directory: str):
     item = q.popleft()
     if not q:
         QUEUES.pop(skey, None)
-    await _dispatch(item["directory"], skey, item["model"], item["text"])
+    await _dispatch(item["directory"], skey, item["model"], item["text"],
+                    item.get("effort"))
 
 
 # --------------------------------------------------------------------------- #
 # Task runner
 # --------------------------------------------------------------------------- #
+_EDIT_ICONS = {"Write": "🆕", "Edit": "✏️", "MultiEdit": "✏️", "NotebookEdit": "📓"}
+
+
 async def _run_task(skey: str, directory: str, prompt: str,
-                    resume_sid: str | None, model: str):
+                    resume_sid: str | None, model: str, effort: str | None = None):
     st = STATUSES.get(skey)
+    if st:
+        st["effort"] = effort
     final = None
     cancelled = False
     error_msg = None
@@ -591,7 +606,8 @@ async def _run_task(skey: str, directory: str, prompt: str,
     async def _consume():
         nonlocal final, error_msg
         async for ev in cc.run(prompt, directory, model, resume_sid,
-                               PERMISSION_MODE, can_use_tool, MCP_SERVER):
+                               PERMISSION_MODE, can_use_tool, MCP_SERVER,
+                               effort=effort):
             t = ev["type"]
             if t == "client":
                 if skey in RUNNING:
@@ -625,7 +641,13 @@ async def _run_task(skey: str, directory: str, prompt: str,
                         fp = (ev["input"].get("file_path") or ev["input"].get("path")
                               or ev["input"].get("notebook_path"))
                         if fp:
-                            st["files_edited"].add(Path(fp).name)
+                            try:
+                                relpath = str(Path(fp).relative_to(directory))
+                            except ValueError:
+                                relpath = fp
+                            icon = _EDIT_ICONS.get(ev["name"], "✏️")
+                            if relpath not in st["files_edited"]:
+                                st["files_edited"][relpath] = icon
                 await _update_status(skey, force=True)
             elif t == "usage":
                 if st:
@@ -662,11 +684,12 @@ async def _run_task(skey: str, directory: str, prompt: str,
             _finish(skey, directory, final, cancelled=cancelled, error_msg=error_msg))
 
 
-async def _dispatch(directory: str, skey: str, model: str, text: str):
+async def _dispatch(directory: str, skey: str, model: str, text: str,
+                    effort: str | None = None):
     """Send a prompt: create the status message and launch the task (or queue)."""
     if skey in STATUSES:  # busy → queue
         QUEUES.setdefault(skey, deque()).append(
-            {"text": text, "directory": directory, "model": model})
+            {"text": text, "directory": directory, "model": model, "effort": effort})
         pos = len(QUEUES[skey])
         sid = _resume_for(skey)
         line = _active_line(directory, sid, model)
@@ -719,7 +742,7 @@ async def _dispatch(directory: str, skey: str, model: str, text: str):
     except Exception as exc:  # noqa: BLE001
         logger.warning(f"inflight_add failed: {exc}")
 
-    task = asyncio.create_task(_run_task(skey, directory, text, resume_sid, model))
+    task = asyncio.create_task(_run_task(skey, directory, text, resume_sid, model, effort))
     RUNNING[skey]["task"] = task
 
 
@@ -904,7 +927,7 @@ async def cb_setmodel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             return
         cwd = active["directory"]
         sid = active.get("claude_session_id")
-        db.set_active(cwd, sid, model)
+        db.set_active(cwd, sid, model, active.get("effort"))
         if sid:
             db.set_session_model(sid, model)
         # Show the whole session so it's clear *which* session got the new model.
@@ -938,7 +961,8 @@ async def cb_actsess(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     sid, cwd = vals
     meta = db.get_session_meta(sid)
     model = (meta or {}).get("model") or cc.DEFAULT_MODEL
-    db.set_active(cwd, sid, model)
+    effort = (meta or {}).get("effort")
+    db.set_active(cwd, sid, model, effort)
     await q.edit_message_text(
         _active_card(cwd, sid, model, header="✅ *Sesión activa*"),
         parse_mode="Markdown")
@@ -1111,6 +1135,85 @@ async def cmd_models(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"🧩 Modelo actual: `{_model_label(cur)}`\nElige:",
                                     reply_markup=InlineKeyboardMarkup(btns),
                                     parse_mode="Markdown")
+
+
+# Effort levels per model family. Haiku has no configurable effort.
+_EFFORT_LEVELS = {
+    "fable":  ["low", "medium", "high", "xhigh", "max"],
+    "opus":   ["low", "medium", "high", "xhigh", "max"],
+    "sonnet": ["low", "medium", "high", "max"],
+    "haiku":  [],
+}
+
+
+def _family_of_alias(alias: str | None) -> str | None:
+    if not alias:
+        return None
+    for fam in ("fable", "opus", "sonnet", "haiku"):
+        if fam in alias:
+            return fam
+    return None
+
+
+@admin_only
+async def cmd_esfuerzo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    active = db.get_active()
+    if not active:
+        await update.message.reply_text("⚠️ No hay sesión activa. Usa /open.")
+        return
+    model = active.get("model") or cc.DEFAULT_MODEL
+    cur_effort = active.get("effort")
+    fam = _family_of_alias(model)
+    levels = _effort_levels = _EFFORT_LEVELS.get(fam, []) if fam else []
+    if not levels:
+        await update.message.reply_text(
+            f"⚡ El modelo `{model}` (haiku) no tiene nivel de esfuerzo configurable.",
+            parse_mode="Markdown")
+        return
+    btns = []
+    for lvl in levels:
+        is_cur = (lvl == cur_effort) or (cur_effort is None and lvl == "high")
+        label = ("✅ " if is_cur else "") + lvl
+        btns.append([InlineKeyboardButton(label, callback_data=f"seteffort:{lvl}")])
+    btns.append([InlineKeyboardButton("❌ Cancelar", callback_data="cancel:")])
+    cur_display = cur_effort or "high"
+    await update.message.reply_text(
+        f"⚡ Nivel de esfuerzo actual: `{cur_display}`\n"
+        f"🧩 Modelo: `{model}`\nElige:",
+        reply_markup=InlineKeyboardMarkup(btns),
+        parse_mode="Markdown")
+
+
+async def cb_seteffort(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    effort = q.data.split(":")[1]
+    valid = {"low", "medium", "high", "xhigh", "max"}
+    if effort not in valid:
+        await q.edit_message_text("⚠️ Nivel no válido.")
+        return
+    active = db.get_active()
+    if not active:
+        await q.edit_message_text("⚠️ No hay sesión activa. Usa /open.")
+        return
+    model = active.get("model") or cc.DEFAULT_MODEL
+    fam = _family_of_alias(model)
+    allowed = _EFFORT_LEVELS.get(fam, []) if fam else []
+    if effort not in allowed:
+        await q.edit_message_text(
+            f"⚠️ `{effort}` no está disponible para el modelo `{model}`.",
+            parse_mode="Markdown")
+        return
+    stored = None if effort == "high" else effort
+    db.update_active_effort(stored)
+    sid = active.get("claude_session_id")
+    if sid:
+        db.set_session_effort(sid, stored)
+    cwd = active["directory"]
+    await q.edit_message_text(
+        f"✅ *Esfuerzo cambiado a* `{effort}`\n"
+        f"📂 `{Path(cwd).name}` · 🧩 `{model}`",
+        parse_mode="Markdown")
 
 
 @admin_only
@@ -1322,6 +1425,26 @@ async def cb_abort(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await q.edit_message_text(msg, parse_mode="Markdown")
     except BadRequest:
         await APP.bot.send_message(ADMIN_ID, msg)
+
+
+# --------------------------------------------------------------------------- #
+# /cambios
+# --------------------------------------------------------------------------- #
+@admin_only
+async def cmd_cambios(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    active = db.get_active()
+    if not active or not active.get("directory"):
+        await update.message.reply_text("⚠️ No hay sesión activa. Usa /open.")
+        return
+    skey = _skey(active["directory"], active.get("claude_session_id"))
+    files = LAST_EDITED.get(skey, {})
+    if not files:
+        await update.message.reply_text("No hay cambios registrados para la sesión activa.")
+        return
+    lines = ["📝 *Archivos modificados en la última ejecución:*"]
+    for rp, ico in files.items():
+        lines.append(f"  {ico} `{rp}`")
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
 
 # --------------------------------------------------------------------------- #
@@ -1541,10 +1664,14 @@ async def _send_to_target(q, cwd: str, skey: str, model: str, label: str):
                 f"📤 Enviando a {label}…\n_{suffix}_", parse_mode="Markdown")
         except BadRequest:
             await q.edit_message_text(f"📤 Enviando…")
-        await _dispatch(cwd, skey, model, pending)
+        sid_for_effort = _resume_for(skey)
+        effort = (db.get_session_meta(sid_for_effort) or {}).get("effort") if sid_for_effort else None
+        await _dispatch(cwd, skey, model, pending, effort)
     else:
         # No text yet — hold destination; handle_text dispatches on next message.
-        target = {"skey": skey, "directory": cwd, "model": model}
+        sid_for_effort = _resume_for(skey)
+        effort = (db.get_session_meta(sid_for_effort) or {}).get("effort") if sid_for_effort else None
+        target = {"skey": skey, "directory": cwd, "model": model, "effort": effort}
         if oneshot:
             target["oneshot_pre"] = oneshot_pre  # carry flag for handle_text
             SEND_MODE["oneshot"] = False          # flag consumed, info in target
@@ -1731,7 +1858,8 @@ async def handle_audio(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     await status.edit_text(f"🎙️ *Transcrito → enviando:*\n\n{text}", parse_mode="Markdown")
     skey = _skey(active["directory"], active.get("claude_session_id"))
-    await _dispatch(active["directory"], skey, active.get("model") or cc.DEFAULT_MODEL, text)
+    await _dispatch(active["directory"], skey, active.get("model") or cc.DEFAULT_MODEL, text,
+                    active.get("effort"))
 
 
 # --------------------------------------------------------------------------- #
@@ -1804,11 +1932,13 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     # Resolve target: reply > send target > active
     reply = update.message.reply_to_message
+    effort = None
     if reply and reply.from_user and reply.from_user.is_bot and reply.message_id in MSG2SESS:
         tgt = MSG2SESS[reply.message_id]
         directory, skey = tgt["directory"], tgt["skey"]
         meta = db.get_session_meta(_resume_for(skey) or "")
         model = (meta or {}).get("model") or _active_model()
+        effort = (meta or {}).get("effort")
     elif SEND_MODE["on"] and SEND_MODE["target"] is None:
         SEND_MODE["pending_text"] = text
         await cmd_multisesion(update, ctx)
@@ -1816,6 +1946,7 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     elif SEND_MODE["target"]:
         t = SEND_MODE["target"]
         directory, skey, model = t["directory"], t["skey"], t["model"]
+        effort = t.get("effort")
         SEND_MODE["target"] = None
         if "oneshot_pre" in t:
             SEND_MODE["on"] = t["oneshot_pre"]  # restore mode after one-shot send
@@ -1827,8 +1958,9 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         directory = active["directory"]
         skey = _skey(directory, active.get("claude_session_id"))
         model = active.get("model") or cc.DEFAULT_MODEL
+        effort = active.get("effort")
 
-    await _dispatch(directory, skey, model, text)
+    await _dispatch(directory, skey, model, text, effort)
 
 
 # --------------------------------------------------------------------------- #
@@ -1839,8 +1971,10 @@ HELP = (
     "/open — navegar carpetas, abrir proyecto / sesión\n"
     "/sessions — gestionar sesiones de un proyecto\n"
     "/models — cambiar modelo (fable-5/opus/sonnet/haiku)\n"
+    "/esfuerzo — nivel de esfuerzo/razonamiento (low/medium/high/xhigh/max)\n"
     "/rename — renombrar la sesión activa (`/rename mi nombre`)\n"
     "/btw — pregunta rápida sobre la sesión, sin tocar su historial\n"
+    "/cambios — archivos modificados en la última ejecución\n"
     "/permisos — modo de permisos\n"
     "/send — envío único a sesión específica (un tiro)\n"
     "/multisesion — pregunta destino en cada mensaje\n"
@@ -1974,8 +2108,10 @@ def main():
     app.add_handler(CommandHandler("sessions", cmd_sessions))
     app.add_handler(CommandHandler("close", cmd_close))
     app.add_handler(CommandHandler("models", cmd_models))
+    app.add_handler(CommandHandler("esfuerzo", cmd_esfuerzo))
     app.add_handler(CommandHandler("rename", cmd_rename))
     app.add_handler(CommandHandler("btw", cmd_btw))
+    app.add_handler(CommandHandler("cambios", cmd_cambios))
     app.add_handler(CommandHandler("permisos", cmd_permisos))
     app.add_handler(CommandHandler("send", cmd_send))
     app.add_handler(CommandHandler("multisesion", cmd_multisesion))
@@ -1988,6 +2124,7 @@ def main():
     app.add_handler(CallbackQueryHandler(cb_os, pattern=r"^os:"))
     app.add_handler(CallbackQueryHandler(cb_newsess, pattern=r"^newsess:"))
     app.add_handler(CallbackQueryHandler(cb_setmodel, pattern=r"^setmodel:"))
+    app.add_handler(CallbackQueryHandler(cb_seteffort, pattern=r"^seteffort:"))
     app.add_handler(CallbackQueryHandler(cb_actsess, pattern=r"^actsess:"))
     app.add_handler(CallbackQueryHandler(cb_delsess, pattern=r"^delsess:"))
     app.add_handler(CallbackQueryHandler(cb_sesspick, pattern=r"^sesspick:"))
@@ -2025,8 +2162,10 @@ def main():
             BotCommand("sessions", "Gestionar sesiones"),
             BotCommand("projects", "Proyectos con sesiones"),
             BotCommand("models", "Cambiar modelo"),
+            BotCommand("esfuerzo", "Nivel de esfuerzo (low/medium/high/xhigh/max)"),
             BotCommand("rename", "Renombrar sesión activa"),
             BotCommand("btw", "Pregunta rápida (no afecta historial)"),
+            BotCommand("cambios", "Archivos modificados en la última ejecución"),
             BotCommand("permisos", "Modo de permisos"),
             BotCommand("send", "Envío único a sesión específica"),
             BotCommand("multisesion", "Preguntar destino en cada mensaje"),

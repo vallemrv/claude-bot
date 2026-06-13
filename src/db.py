@@ -35,7 +35,8 @@ def init() -> None:
                 id                INTEGER PRIMARY KEY CHECK (id = 1),
                 directory         TEXT NOT NULL,
                 claude_session_id TEXT,
-                model             TEXT
+                model             TEXT,
+                effort            TEXT
             )
         """)
         con.execute("""
@@ -44,9 +45,16 @@ def init() -> None:
                 directory         TEXT NOT NULL,
                 model             TEXT,
                 title             TEXT,
-                created_at        REAL
+                created_at        REAL,
+                effort            TEXT
             )
         """)
+        # Idempotent column additions for existing DBs (SQLite has no ADD COLUMN IF NOT EXISTS).
+        for table, col in [("active", "effort"), ("session_meta", "effort")]:
+            try:
+                con.execute(f"ALTER TABLE {table} ADD COLUMN {col} TEXT")
+            except Exception:  # noqa: BLE001
+                pass  # column already exists
         # Persisted callback keystore: maps the small ints embedded in
         # callback_data to their real string value. Persisting it means inline
         # buttons from before a restart still resolve (no silent "" surprises).
@@ -84,24 +92,26 @@ def init() -> None:
 # Active session pointer
 # --------------------------------------------------------------------------- #
 def get_active() -> dict | None:
-    """Return {directory, claude_session_id, model} or None."""
+    """Return {directory, claude_session_id, model, effort} or None."""
     with _conn() as con:
         row = con.execute(
-            "SELECT directory, claude_session_id, model FROM active WHERE id = 1"
+            "SELECT directory, claude_session_id, model, effort FROM active WHERE id = 1"
         ).fetchone()
         return dict(row) if row else None
 
 
-def set_active(directory: str, claude_session_id: str | None, model: str | None) -> None:
+def set_active(directory: str, claude_session_id: str | None, model: str | None,
+               effort: str | None = None) -> None:
     with _conn() as con:
         con.execute("""
-            INSERT INTO active (id, directory, claude_session_id, model)
-            VALUES (1, ?, ?, ?)
+            INSERT INTO active (id, directory, claude_session_id, model, effort)
+            VALUES (1, ?, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET
                 directory = excluded.directory,
                 claude_session_id = excluded.claude_session_id,
-                model = excluded.model
-        """, (directory, claude_session_id, model))
+                model = excluded.model,
+                effort = excluded.effort
+        """, (directory, claude_session_id, model, effort))
 
 
 def update_active_session_id(claude_session_id: str) -> None:
@@ -111,6 +121,12 @@ def update_active_session_id(claude_session_id: str) -> None:
             "UPDATE active SET claude_session_id = ? WHERE id = 1",
             (claude_session_id,),
         )
+
+
+def update_active_effort(effort: str | None) -> None:
+    """Update only the effort on the active pointer."""
+    with _conn() as con:
+        con.execute("UPDATE active SET effort = ? WHERE id = 1", (effort,))
 
 
 def clear_active() -> None:
@@ -145,7 +161,7 @@ def remember_session(claude_session_id: str, directory: str,
 def get_session_meta(claude_session_id: str) -> dict | None:
     with _conn() as con:
         row = con.execute(
-            "SELECT claude_session_id, directory, model, title FROM session_meta "
+            "SELECT claude_session_id, directory, model, title, effort FROM session_meta "
             "WHERE claude_session_id = ?",
             (claude_session_id,),
         ).fetchone()
@@ -157,6 +173,14 @@ def set_session_model(claude_session_id: str, model: str) -> None:
         con.execute(
             "UPDATE session_meta SET model = ? WHERE claude_session_id = ?",
             (model, claude_session_id),
+        )
+
+
+def set_session_effort(claude_session_id: str, effort: str | None) -> None:
+    with _conn() as con:
+        con.execute(
+            "UPDATE session_meta SET effort = ? WHERE claude_session_id = ?",
+            (effort, claude_session_id),
         )
 
 

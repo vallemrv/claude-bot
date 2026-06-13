@@ -163,7 +163,8 @@ def _normalize(msg):
 # Main entry point
 # --------------------------------------------------------------------------- #
 async def run(prompt: str, cwd: str, model: str | None, resume_session_id: str | None,
-              permission_mode: str, can_use_tool, mcp_server):
+              permission_mode: str, can_use_tool, mcp_server,
+              effort: str | None = None):
     """Async generator of normalized events for one prompt."""
     kwargs = dict(
         cwd=cwd,
@@ -174,6 +175,8 @@ async def run(prompt: str, cwd: str, model: str | None, resume_session_id: str |
         kwargs["model"] = cli_model(model)
     if resume_session_id:
         kwargs["resume"] = resume_session_id
+    if effort is not None:
+        kwargs["effort"] = effort
     if mcp_server is not None:
         kwargs["mcp_servers"] = {"bot": mcp_server}
         kwargs["allowed_tools"] = ["mcp__bot__ask_user"]
