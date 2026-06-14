@@ -1,4 +1,4 @@
-python-telegram-bot[job-queue]==21.11.1
+python-telegram-bot==21.11.1
 claude-agent-sdk>=0.2.87
 python-dotenv>=1.0
 httpx>=0.27

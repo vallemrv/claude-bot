@@ -51,6 +51,9 @@ DEFAULT_PERMISSION_MODE = os.getenv("PERMISSION_MODE", "bypassPermissions")
 TASK_TIMEOUT = int(os.getenv("TASK_TIMEOUT", "1800"))
 BOT_DIR = str(Path(__file__).parent.parent.resolve())
 TMP_DIR = Path("/tmp/claude-bot-media")
+# Scratch dir for /tmp throwaway sessions. Under /tmp so it's wiped on reboot,
+# and outside WORKSPACE so it never shows up as a project in /open.
+SCRATCH_DIR = Path("/tmp/claude-tmp")
 RESTART_FLAG = Path("/tmp/claude-bot-restarting.flag")
 
 MCP_SERVER = cc.build_mcp_server()
@@ -60,6 +63,8 @@ APP: Application | None = None
 PERMISSION_MODE = DEFAULT_PERMISSION_MODE
 
 STATUSES: dict = {}        # skey -> status dict
+_FLUSHER_TASK = None       # asyncio.Task — single status-render worker
+_STATUS_WAKE = None        # asyncio.Event — pinged when a status needs a redraw
 RUNNING: dict = {}         # skey -> {"client", "task", "directory"}
 QUEUES: dict = {}          # skey -> deque[{"text","directory","model"}]
 MSG2SESS: dict = {}        # bot message_id -> {"skey","directory"}
@@ -84,8 +89,18 @@ PENDING_INPUT: dict = {}   # {"kind": "rename"|"btw", "sid", "directory", "msg_i
 # don't mix up which project a permission/question belongs to.
 CURRENT_CTX: contextvars.ContextVar = contextvars.ContextVar("current_ctx", default=None)
 
-STATUS_INTERVAL = 10
-STATUS_THROTTLE = 3
+# Status rendering is decoupled from the SDK event stream: events only flag the
+# status "dirty" (cheap, in-memory) and wake the flush worker; the worker owns the
+# actual Telegram edits. It is event-driven, not a fixed grid: it sleeps exactly
+# until the next status is actionable and wakes the instant something changes, so a
+# discrete event (a new tool after a quiet stretch) paints almost immediately
+# instead of waiting out a tick. STATUS_MIN_INTERVAL is the hard floor between
+# edits to one message (the real Telegram rate-limit guard, decoupled from
+# responsiveness); STATUS_LIVENESS_INTERVAL forces a redraw during silence so the
+# elapsed clock keeps ticking even while no events arrive.
+STATUS_MIN_INTERVAL = 2.0     # min seconds between edits to one status (rate-limit floor)
+STATUS_LIVENESS_INTERVAL = 4  # redraw at least this often so elapsed time stays fresh
+STATUS_RETRY_CAP = 10         # cap a Telegram RetryAfter backoff so a 429 can't wedge a status
 MSG_TRACK_LIMIT = 200
 # Cualquier respuesta que no quepa en un solo mensaje de Telegram (~4096) se
 # manda como respuesta.md en vez de trocearse en varios. El corte va por debajo
@@ -448,6 +463,9 @@ def _build_status_text(st: dict) -> str:
     if st.get("reasoning_text"):
         snip = st["reasoning_text"][-200:].replace("`", "'").replace("*", "")
         lines.append(f"💭 _{snip}_")
+    if st.get("stream_text"):
+        snip = st["stream_text"][-200:].replace("`", "'").replace("*", "")
+        lines.append(f"✍️ _{snip}_")
     tok_in = st.get("tokens_input", 0)
     if tok_in:
         ctx_str, _ = _ctx_pct(tok_in, st.get("model"))
@@ -456,14 +474,30 @@ def _build_status_text(st: dict) -> str:
     return "\n".join(lines)
 
 
-async def _update_status(skey: str, force: bool = False):
+def _touch_status(st: dict | None):
+    """Mark a status as needing a redraw and wake the flush worker. Cheap and
+    non-blocking — called from the SDK event loop so consuming events never waits
+    on a Telegram round-trip. Only the first touch after a flush rings the wake
+    bell: once a status is already dirty its actionable deadline is fixed, so
+    further touches (per-token deltas) would just spin the worker for nothing."""
+    if st:
+        was_dirty = st.get("dirty")
+        st["dirty"] = True
+        if not was_dirty and _STATUS_WAKE is not None:
+            _STATUS_WAKE.set()
+
+
+async def _flush_status(skey: str):
+    """Push the current status text to Telegram. The single flush worker owns the
+    actual edits. On RetryAfter we do NOT sleep here (that would freeze the serial
+    worker — and thus every other live status — for the whole backoff window);
+    instead we defer this status's next edit by pushing its clock forward and
+    re-marking it dirty, so the worker keeps serving the rest meanwhile."""
     st = STATUSES.get(skey)
     if not st or not st.get("msg_id"):
         return
-    now = time.time()
-    if not force and (now - st.get("last_update_time", 0)) < STATUS_THROTTLE:
-        return
-    st["last_update_time"] = now
+    st["dirty"] = False
+    st["last_update_time"] = time.time()
     try:
         await APP.bot.edit_message_text(
             chat_id=ADMIN_ID, message_id=st["msg_id"],
@@ -474,20 +508,98 @@ async def _update_status(skey: str, force: bool = False):
     except BadRequest:
         pass
     except RetryAfter as e:
-        await asyncio.sleep(e.retry_after)
+        delay = min(float(getattr(e, "retry_after", STATUS_MIN_INTERVAL)), STATUS_RETRY_CAP)
+        st["last_update_time"] = time.time() + delay  # don't retry until backoff clears
+        st["dirty"] = True
     except NetworkError:
         pass
 
 
-async def _heartbeat(ctx: ContextTypes.DEFAULT_TYPE):
-    for skey in list(STATUSES.keys()):
-        await _update_status(skey, force=False)
+async def _relocate_status(skey: str | None):
+    """After a mid-task question is answered, move the live status message below
+    the answer so the chat stays chronological (otherwise the still-updating
+    status sits *above* the question/answer). No-op if the task already finished
+    (skey gone from STATUSES) or its status has no message yet. Sends the new
+    message and repoints the updater at it *before* deleting the old one, so the
+    throttled updater/heartbeat never targets a just-deleted message."""
+    if not skey:
+        return
+    st = STATUSES.get(skey)
+    if not st or not st.get("msg_id"):
+        return
+    old_id = st["msg_id"]
+    try:
+        msg = await APP.bot.send_message(
+            chat_id=ADMIN_ID, text=_build_status_text(st), parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("❌ Cancelar", callback_data="abort:")]]),
+        )
+    except (BadRequest, RetryAfter, NetworkError):
+        return  # keep the old status rather than losing it entirely
+    st["msg_id"] = msg.message_id
+    st["last_update_time"] = time.time()
+    st["dirty"] = False
+    try:
+        await APP.bot.delete_message(chat_id=ADMIN_ID, message_id=old_id)
+    except (BadRequest, RetryAfter, NetworkError):
+        pass
 
 
-def _ensure_heartbeat():
-    if APP.job_queue and not APP.job_queue.get_jobs_by_name("hb"):
-        APP.job_queue.run_repeating(_heartbeat, interval=STATUS_INTERVAL,
-                                    first=STATUS_INTERVAL, name="hb")
+def _next_flush_delay() -> float:
+    """Seconds until the soonest status needs an edit. A dirty status is due once
+    STATUS_MIN_INTERVAL has passed since its last edit (the rate-limit floor); a
+    clean one is due at STATUS_LIVENESS_INTERVAL so its elapsed clock keeps moving.
+    The worker waits this long, but a fresh event can cut the wait short via the
+    wake bell. Returns 0 if something is already due."""
+    now = time.time()
+    deadlines = []
+    for st in list(STATUSES.values()):
+        if not st or not st.get("msg_id"):
+            continue
+        last = st.get("last_update_time", 0)
+        span = STATUS_MIN_INTERVAL if st.get("dirty") else STATUS_LIVENESS_INTERVAL
+        deadlines.append(last + span)
+    if not deadlines:
+        return STATUS_LIVENESS_INTERVAL
+    return max(0.0, min(deadlines) - now)
+
+
+async def _flusher_loop():
+    """Single background worker that renders all live statuses. Runs as a plain
+    asyncio task (NOT job_queue — the [job-queue] extra/APScheduler may be absent,
+    in which case APP.job_queue is None and nothing would ever refresh). It is
+    event-driven: it sleeps exactly until the next status is actionable (or until a
+    new event rings the wake bell, whichever comes first), then edits every status
+    whose dirty/liveness deadline has passed. This coalesces per-token delta bursts
+    into one edit per STATUS_MIN_INTERVAL while painting discrete changes promptly.
+    Self-terminates when there are no live statuses left."""
+    while STATUSES:
+        try:
+            await asyncio.wait_for(_STATUS_WAKE.wait(), timeout=_next_flush_delay())
+        except asyncio.TimeoutError:
+            pass
+        _STATUS_WAKE.clear()
+        now = time.time()
+        for skey in list(STATUSES.keys()):
+            st = STATUSES.get(skey)
+            if not st or not st.get("msg_id"):
+                continue
+            since = now - st.get("last_update_time", 0)
+            due = (st.get("dirty") and since >= STATUS_MIN_INTERVAL) \
+                or since >= STATUS_LIVENESS_INTERVAL
+            if due:
+                try:
+                    await _flush_status(skey)
+                except Exception as exc:  # noqa: BLE001 — never let one bad edit kill the loop
+                    logger.warning(f"status flush failed for {skey}: {exc}")
+
+
+def _ensure_flusher():
+    global _FLUSHER_TASK, _STATUS_WAKE
+    if _STATUS_WAKE is None:
+        _STATUS_WAKE = asyncio.Event()
+    if _FLUSHER_TASK is None or _FLUSHER_TASK.done():
+        _FLUSHER_TASK = asyncio.create_task(_flusher_loop())
 
 
 def _start_status(skey: str, directory: str, msg_id: int, model: str,
@@ -496,11 +608,11 @@ def _start_status(skey: str, directory: str, msg_id: int, model: str,
         "msg_id": msg_id, "directory": directory, "model": model,
         "session_label": session_label,
         "state": "pending", "tool": None, "tools_seen": [], "files_edited": {},
-        "reasoning_text": None, "start_time": time.time(),
+        "reasoning_text": None, "stream_text": "", "start_time": time.time(),
         "last_update_time": time.time(), "tokens_input": 0, "tokens_output": 0,
-        "cost": 0.0,
+        "cost": 0.0, "dirty": False,
     }
-    _ensure_heartbeat()
+    _ensure_flusher()
 
 
 # --------------------------------------------------------------------------- #
@@ -622,9 +734,7 @@ async def _finish(skey: str, directory: str, final: dict | None,
         db.inflight_remove(skey)
     except Exception as exc:  # noqa: BLE001
         logger.warning(f"inflight_remove failed: {exc}")
-    if APP.job_queue and not STATUSES:
-        for j in APP.job_queue.get_jobs_by_name("hb"):
-            j.schedule_removal()
+    # The flusher loop self-terminates once STATUSES is empty (no cleanup needed).
     if st and st.get("msg_id"):
         await _delete_msg(APP.bot, st["msg_id"])
     if st:
@@ -703,15 +813,39 @@ async def _run_task(skey: str, directory: str, prompt: str,
             elif t == "text":
                 if st:
                     st["state"] = "busy"
-                await _update_status(skey)
+                    _touch_status(st)
             elif t == "thinking":
                 if st:
                     st["state"] = "thinking"
                     st["reasoning_text"] = ev["text"]
-                await _update_status(skey)
+                    _touch_status(st)
+            elif t == "stream_start":
+                if st:
+                    block = ev.get("block")
+                    if block == "thinking":
+                        st["state"] = "thinking"
+                        st["reasoning_text"] = ""
+                        _touch_status(st)
+                    elif block == "text":
+                        st["state"] = "busy"
+                        st["stream_text"] = ""
+                        st["tool"] = ""
+                        st["tool_arg"] = ""
+                        _touch_status(st)
+            elif t == "thinking_delta":
+                if st:
+                    st["state"] = "thinking"
+                    st["reasoning_text"] = st.get("reasoning_text", "") + ev["text"]
+                    _touch_status(st)
+            elif t == "text_delta":
+                if st:
+                    st["state"] = "busy"
+                    st["stream_text"] = st.get("stream_text", "") + ev["text"]
+                    _touch_status(st)
             elif t == "tool":
                 if st:
                     st["state"] = "busy"
+                    st["stream_text"] = ""
                     st["tool"] = ev["name"]
                     st["tool_arg"] = _tool_arg(ev["name"], ev["input"], directory)
                     if ev["name"] not in st["tools_seen"]:
@@ -727,7 +861,7 @@ async def _run_task(skey: str, directory: str, prompt: str,
                             icon = _EDIT_ICONS.get(ev["name"], "✏️")
                             if relpath not in st["files_edited"]:
                                 st["files_edited"][relpath] = icon
-                await _update_status(skey, force=True)
+                    _touch_status(st)
             elif t == "usage":
                 if st:
                     st["tokens_input"] = ev["input"]
@@ -1454,6 +1588,32 @@ async def cmd_init(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await _dispatch(directory, skey, model, "/init", active.get("effort"))
 
 
+@admin_only
+async def cmd_tmp(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Sesión temporal en /tmp/claude-tmp (scratch, se borra al reiniciar el PC).
+    NO cambia la sesión activa: se continúa respondiendo (reply) a sus mensajes.
+    `/tmp <texto>` despacha ya; `/tmp` a secas deja un ancla para responderle."""
+    SCRATCH_DIR.mkdir(parents=True, exist_ok=True)
+    cwd = str(SCRATCH_DIR)
+    skey = _skey(cwd, None)
+    meta = db.get_session_meta(_resume_for(skey) or "")
+    model = (meta or {}).get("model") or cc.DEFAULT_MODEL
+    text = " ".join(ctx.args).strip() if ctx.args else ""
+    if text:
+        # Dispatch straight to the temp session; its status + reply messages get
+        # tracked in MSG2SESS, so replying to any of them continues it.
+        await _dispatch(cwd, skey, model, text)
+        return
+    # No prompt → post an anchor and track it, so a reply starts the conversation.
+    sent = await update.message.reply_text(
+        "🧪 *Sesión temporal* — `/tmp/claude-tmp`\n"
+        "No cambia tu sesión activa.\n\n"
+        "↩️ _Responde a este mensaje_ para hablar con ella.",
+        parse_mode="Markdown")
+    if sent:
+        _track_msg(sent.message_id, skey, cwd)
+
+
 PERM_MODES = ["bypassPermissions", "acceptEdits", "default", "plan"]
 
 
@@ -1849,7 +2009,8 @@ async def _question_bridge(question: str, options) -> str:
     fut = loop.create_future()
     qid = next(_EPHEMERAL_QID)
     opts = _normalize_options(options)
-    PENDING_Q[qid] = {"future": fut, "options": opts}
+    skey = (CURRENT_CTX.get() or {}).get("skey")
+    PENDING_Q[qid] = {"future": fut, "options": opts, "skey": skey}
 
     # One button per option, numbered so look-alikes (and truncated labels) stay
     # distinguishable. Any option too long for its label gets spelled out in full
@@ -1897,6 +2058,7 @@ async def cb_q_answer(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not data["future"].done():
         data["future"].set_result(answer)
     await q.edit_message_text(f"✅ {answer}")
+    await _relocate_status(data.get("skey"))
 
 
 async def cb_q_custom(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -2283,6 +2445,7 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if data and not data["future"].done():
             data["future"].set_result(text)
             await update.message.reply_text("✅ Respuesta enviada a Claude.")
+            await _relocate_status(data.get("skey"))
         else:
             await update.message.reply_text("⚠️ La pregunta expiró.")
         return
@@ -2332,6 +2495,7 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 HELP = (
     "*claude-bot* — Claude Code por Telegram\n\n"
     "/open — explorar carpetas y abrir/crear sesión\n"
+    "/tmp [texto] — sesión temporal (no cambia la activa); responde a sus mensajes para seguir\n"
     "/sessions — gestionar sesiones de un proyecto\n"
     "/models — cambiar modelo (fable-5/opus/sonnet/haiku)\n"
     "/refreshmodels — actualizar el catálogo de modelos\n"
@@ -2477,6 +2641,7 @@ def main():
     app.add_handler(CommandHandler("refreshmodels", cmd_refreshmodels))
     app.add_handler(CommandHandler("esfuerzo", cmd_esfuerzo))
     app.add_handler(CommandHandler("init", cmd_init))
+    app.add_handler(CommandHandler("tmp", cmd_tmp))
     app.add_handler(CommandHandler("rename", cmd_rename))
     app.add_handler(CommandHandler("btw", cmd_btw))
     app.add_handler(CommandHandler("cambios", cmd_cambios))
@@ -2533,6 +2698,7 @@ def main():
         await application.bot.set_my_commands([
             BotCommand("start", "Estado y menú"),
             BotCommand("open", "Explorar carpetas y abrir/crear sesión"),
+            BotCommand("tmp", "Sesión temporal por reply (no cambia la activa)"),
             BotCommand("sessions", "Gestionar sesiones"),
             BotCommand("models", "Cambiar modelo"),
             BotCommand("refreshmodels", "Actualizar catálogo de modelos"),

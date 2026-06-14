@@ -26,6 +26,7 @@ from claude_agent_sdk import (
     AssistantMessage,
     SystemMessage,
     ResultMessage,
+    StreamEvent,
     TextBlock,
     ThinkingBlock,
     ToolUseBlock,
@@ -177,7 +178,22 @@ def _normalize(msg):
             "subtype": getattr(msg, "subtype", ""),
         }
         return
-    # StreamEvent / RateLimitEvent / UserMessage → ignored for status purposes
+
+    if isinstance(msg, StreamEvent):
+        ev = getattr(msg, "event", None) or {}
+        etype = ev.get("type")
+        if etype == "content_block_start":
+            block = (ev.get("content_block") or {}).get("type")
+            yield {"type": "stream_start", "block": block}
+        elif etype == "content_block_delta":
+            d = ev.get("delta") or {}
+            dtype = d.get("type")
+            if dtype == "thinking_delta" and d.get("thinking"):
+                yield {"type": "thinking_delta", "text": d["thinking"]}
+            elif dtype == "text_delta" and d.get("text"):
+                yield {"type": "text_delta", "text": d["text"]}
+        return
+    # RateLimitEvent / UserMessage → ignored for status purposes
 
 
 # --------------------------------------------------------------------------- #
@@ -191,6 +207,10 @@ async def run(prompt: str, cwd: str, model: str | None, resume_session_id: str |
         cwd=cwd,
         permission_mode=permission_mode,
         setting_sources=["user", "project", "local"],
+        # Stream partial deltas so the live status keeps moving during long
+        # thinking/text phases (otherwise nothing arrives until the whole block
+        # completes and the status freezes showing only the timer).
+        include_partial_messages=True,
     )
     if model:
         kwargs["model"] = cli_model(model)
