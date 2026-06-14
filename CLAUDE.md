@@ -152,7 +152,12 @@ are awaited Futures resolved by callback handlers.
   `restart` which would get SIGTERM'd inside its own cgroup → false "not found".
   The actual restart is launched **detached** via `systemd-run … --collect` so it
   survives our SIGTERM. If neither mode is reachable it explains the options
-  instead of failing silently.
+  instead of failing silently. **Before relaunching it auto-updates the checkout**
+  (`_git_pull_and_deps`): `git pull --ff-only` (never merges or clobbers uncommitted
+  work — if it can't fast-forward it reports and restarts on the current code), and
+  if the pull touched `requirements.txt` it reinstalls deps with the venv python;
+  a failed `pip install` **aborts** the restart so the bot never relaunches into a
+  broken env. So `/restart` always comes back on the newest code.
 - Final replies that don't fit in a single Telegram message (> `MD_FILE_THRESHOLD`,
   ~3500 chars to leave room for the header + MarkdownV2 escaping) are sent as a
   `respuesta.md` document instead of being split across messages. Shorter replies

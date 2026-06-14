@@ -2510,7 +2510,7 @@ HELP = (
     "/exitmulti — salir de multisesión\n"
     "/close — borrar sesiones de un proyecto\n"
     "/esc — cancelar la tarea en curso\n"
-    "/restart — reiniciar el bot\n\n"
+    "/restart — actualizar (git pull + deps) y reiniciar el bot\n\n"
     "Responde a un mensaje del bot para continuar esa sesión concreta.\n"
     "Envía audio para dictar, o archivos para guardarlos en el proyecto."
 )
@@ -2544,6 +2544,48 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 @admin_only
+async def _git_pull_and_deps() -> tuple[str, bool]:
+    """Update this checkout in place before a restart. Returns (report, proceed);
+    proceed=False aborts the restart so we never relaunch into a broken env (e.g.
+    deps failed to install). Safe by design: `git pull --ff-only` never creates a
+    merge commit nor overwrites uncommitted work — if it can't fast-forward it
+    aborts and we just restart with the current code."""
+    import subprocess, sys
+
+    def _run(cmd, timeout):
+        return subprocess.run(cmd, cwd=BOT_DIR, capture_output=True,
+                              text=True, timeout=timeout)
+
+    try:
+        before = (await asyncio.to_thread(
+            _run, ["git", "rev-parse", "HEAD"], 30)).stdout.strip()
+        pull = await asyncio.to_thread(_run, ["git", "pull", "--ff-only"], 120)
+    except Exception as exc:  # noqa: BLE001
+        return (f"⚠️ No pude hacer pull ({exc}); reinicio con el código actual.", True)
+
+    if pull.returncode != 0:
+        tail = ((pull.stderr or pull.stdout).strip().splitlines() or ["desconocido"])[-1]
+        return (f"⚠️ No pude actualizar ({tail}); reinicio con el código actual.", True)
+
+    after = (await asyncio.to_thread(
+        _run, ["git", "rev-parse", "HEAD"], 30)).stdout.strip()
+    if before == after:
+        return ("✅ Ya estaba al día; reinicio.", True)
+
+    short = after[:7]
+    changed = await asyncio.to_thread(
+        _run, ["git", "diff", "--name-only", before, after], 30)
+    if "requirements.txt" in changed.stdout.split():
+        pip = await asyncio.to_thread(
+            _run, [sys.executable, "-m", "pip", "install", "-r", "requirements.txt"], 300)
+        if pip.returncode != 0:
+            tail = (pip.stderr or pip.stdout).strip()[-300:]
+            return (f"❌ Actualizado a {short} pero falló `pip install`; "
+                    f"aborto el reinicio:\n{tail}", False)
+        return (f"✅ Actualizado a {short} + dependencias; reinicio.", True)
+    return (f"✅ Actualizado a {short}; reinicio.", True)
+
+
 async def cmd_restart(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     import subprocess
     service = "claude-bot.service"
@@ -2577,6 +2619,13 @@ async def cmd_restart(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             "• Como servicio de sistema: `sudo systemctl restart claude-bot` "
             "(requiere sudo sin contraseña para hacerlo desde aquí)\n"
             "• A mano: `./run.sh`", parse_mode="Markdown")
+        return
+
+    # Pull latest + (re)install deps before relaunching, so /restart always comes
+    # back on the newest code. Aborts the restart if deps break.
+    report, proceed = await _git_pull_and_deps()
+    await _safe_send(report, parse_mode=None)
+    if not proceed:
         return
 
     msg = await update.message.reply_text("🔄 Reiniciando…")
@@ -2716,7 +2765,7 @@ def main():
             BotCommand("exitmulti", "Salir de multisesión"),
             BotCommand("close", "Cerrar proyecto"),
             BotCommand("esc", "Cancelar tarea"),
-            BotCommand("restart", "Reiniciar bot"),
+            BotCommand("restart", "Actualizar (pull) y reiniciar"),
         ])
 
         # Orphan recovery: any in-flight task row means a prompt was running
