@@ -151,8 +151,10 @@ are awaited Futures resolved by callback handlers.
   nobody can type from Telegram); `cat` finishes before any kill, unlike a plain
   `restart` which would get SIGTERM'd inside its own cgroup → false "not found".
   The actual restart is launched **detached** via `systemd-run … --collect` so it
-  survives our SIGTERM. If neither mode is reachable it explains the options
-  instead of failing silently. **Before relaunching it auto-updates the checkout**
+  survives our SIGTERM. If **no systemd** is reachable (macOS/launchd Mac mini,
+  `./run.sh`, tmux, nohup…) it falls back to **self re-exec** (`os.execv` of the
+  venv python on the same `argv`) — keeps the PID and relaunches in place, so it
+  works under any supervisor or none. **Before relaunching it auto-updates the checkout**
   (`_git_pull_and_deps`): `git pull --ff-only` (never merges or clobbers uncommitted
   work — if it can't fast-forward it reports and restarts on the current code), and
   if the pull touched `requirements.txt` it reinstalls deps with the venv python;

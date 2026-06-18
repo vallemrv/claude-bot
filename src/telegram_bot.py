@@ -2587,15 +2587,16 @@ async def _git_pull_and_deps() -> tuple[str, bool]:
 
 
 async def cmd_restart(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    import subprocess
+    import subprocess, sys
     service = "claude-bot.service"
 
-    # Detect how the bot is running and pick the matching systemctl invocation.
-    # Order: user unit (preferred — Claude's login lives in this user's
-    # ~/.claude) → system unit via passwordless sudo. We probe with `cat`, which
-    # finishes *before* anything kills us (a plain `restart` would get SIGTERM'd
-    # mid-run inside our own cgroup and falsely report failure). `-n` on sudo so
-    # it never blocks waiting for a password nobody can type from Telegram.
+    # Detect how the bot is running and pick the matching restart strategy.
+    # Order: systemd user unit (preferred — Claude's login lives in this user's
+    # ~/.claude) → systemd system unit via passwordless sudo → self re-exec.
+    # We probe systemd with `cat`, which finishes *before* anything kills us (a
+    # plain `restart` would get SIGTERM'd mid-run inside our own cgroup and
+    # falsely report failure). `-n` on sudo so it never blocks waiting for a
+    # password nobody can type from Telegram.
     def _unit_exists(cmd: list[str]) -> bool:
         try:
             return subprocess.run(cmd + ["cat", service],
@@ -2604,6 +2605,7 @@ async def cmd_restart(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         except Exception:  # noqa: BLE001
             return False
 
+    restart_cmd = None  # None ⇒ self re-exec (no systemd available)
     if _unit_exists(["systemctl", "--user"]):
         restart_cmd = ["systemd-run", "--user", "--collect",
                        "systemctl", "--user", "restart", service]
@@ -2612,14 +2614,9 @@ async def cmd_restart(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         # *system* unit so the restart survives our own SIGTERM.
         restart_cmd = ["sudo", "-n", "systemd-run", "--collect",
                        "systemctl", "restart", service]
-    else:
-        await update.message.reply_text(
-            "⚠️ No puedo reiniciar automáticamente.\n"
-            "• Como servicio de usuario: `systemctl --user restart claude-bot`\n"
-            "• Como servicio de sistema: `sudo systemctl restart claude-bot` "
-            "(requiere sudo sin contraseña para hacerlo desde aquí)\n"
-            "• A mano: `./run.sh`", parse_mode="Markdown")
-        return
+    # else: no systemd (macOS/launchd, ./run.sh, tmux, nohup…). Fall back to
+    # replacing our own process image in place — works under any supervisor (or
+    # none), since os.execv keeps the PID and just relaunches the same argv.
 
     # Pull latest + (re)install deps before relaunching, so /restart always comes
     # back on the newest code. Aborts the restart if deps break.
@@ -2633,7 +2630,15 @@ async def cmd_restart(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     # Fire-and-forget; the success message is shown by post_init via
     # RESTART_FLAG once we come back up.
     try:
-        subprocess.Popen(restart_cmd)
+        if restart_cmd is not None:
+            subprocess.Popen(restart_cmd)
+        else:
+            # Self re-exec: replace this process with a fresh interpreter running
+            # the same script. Never returns on success. sys.stdout/err are
+            # flushed first so the "🔄 Reiniciando…" log line isn't lost.
+            sys.stdout.flush()
+            sys.stderr.flush()
+            os.execv(sys.executable, [sys.executable, *sys.argv])
     except Exception as exc:  # noqa: BLE001
         RESTART_FLAG.unlink(missing_ok=True)
         await _safe_send(f"❌ No pude lanzar el reinicio: `{exc}`",
@@ -2649,6 +2654,11 @@ async def on_error(update: object, ctx: ContextTypes.DEFAULT_TYPE):
     follow-up message)."""
     err = ctx.error
     if isinstance(err, asyncio.CancelledError):
+        return
+    # Transient polling/network blips (httpx.ReadError, timeouts) are self-healing:
+    # PTB retries getUpdates automatically. Log but don't spam the admin.
+    if isinstance(err, NetworkError):
+        logger.warning("Transient network error (polling): %s", err)
         return
     logger.error("Unhandled error in handler", exc_info=err)
     # Surface a short, safe summary to the admin. Never raise from here.
