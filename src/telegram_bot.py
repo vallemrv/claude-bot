@@ -765,8 +765,35 @@ async def _drain_queue(skey: str, directory: str):
     if not q:
         return
     item = q.popleft()
+    # Delete the queue position message for this item.
+    msg_id = item.get("queue_msg_id")
+    if msg_id:
+        try:
+            await APP.bot.delete_message(ADMIN_ID, msg_id)
+        except Exception:
+            pass
     if not q:
         QUEUES.pop(skey, None)
+    else:
+        # Renumber the remaining queue messages.
+        sid = _resume_for(skey)
+        sk = _key(skey)
+        for i, remaining in enumerate(q, start=1):
+            rmsg_id = remaining.get("queue_msg_id")
+            if not rmsg_id:
+                continue
+            try:
+                await APP.bot.edit_message_text(
+                    _queue_msg_text(i, remaining["directory"], remaining["model"],
+                                    sid, remaining["text"]),
+                    chat_id=ADMIN_ID,
+                    message_id=rmsg_id,
+                    parse_mode="Markdown",
+                    reply_markup=InlineKeyboardMarkup([[
+                        InlineKeyboardButton("❌ Cancelar cola",
+                                             callback_data=f"qcancel:{sk}")]]))
+            except Exception:
+                pass
     await _dispatch(item["directory"], skey, item["model"], item["text"],
                     item.get("effort"))
 
@@ -884,8 +911,11 @@ async def _run_task(skey: str, directory: str, prompt: str,
         # Hard wall-clock cap so a hung CLI can't pin the session forever.
         await asyncio.wait_for(_consume(), timeout=TASK_TIMEOUT)
     except asyncio.TimeoutError:
-        logger.warning(f"task {skey} timed out after {TASK_TIMEOUT}s")
-        error_msg = f"Tiempo límite agotado ({TASK_TIMEOUT}s) — tarea interrumpida."
+        last_tool = (st.get("tool") or "") if st else ""
+        last_arg = (st.get("tool_arg") or "") if st else ""
+        tool_hint = f"\n⚙️ Último: `{last_tool}" + (f": {last_arg}`" if last_arg else "`") if last_tool else ""
+        logger.warning(f"task {skey} timed out after {TASK_TIMEOUT}s — last tool: {last_tool} {last_arg}")
+        error_msg = f"Tiempo límite agotado ({TASK_TIMEOUT}s) — tarea interrumpida.{tool_hint}"
         await _interrupt_client(skey)
     except asyncio.CancelledError:
         logger.info(f"task {skey} cancelled")
@@ -903,6 +933,12 @@ async def _run_task(skey: str, directory: str, prompt: str,
             _finish(skey, directory, final, cancelled=cancelled, error_msg=error_msg))
 
 
+def _queue_msg_text(pos: int, directory: str, model: str, sid: str | None, text: str) -> str:
+    line = _active_line(directory, sid, model)
+    return (f"⏳ *Ocupado* — en cola (posición {pos})\n{line}\n"
+            f"📨 _«{text.strip()[:120]}»_")
+
+
 async def _dispatch(directory: str, skey: str, model: str, text: str,
                     effort: str | None = None):
     """Send a prompt: create the status message and launch the task (or queue)."""
@@ -911,13 +947,16 @@ async def _dispatch(directory: str, skey: str, model: str, text: str,
             {"text": text, "directory": directory, "model": model, "effort": effort})
         pos = len(QUEUES[skey])
         sid = _resume_for(skey)
-        line = _active_line(directory, sid, model)
-        await _safe_send(
-            f"⏳ *Ocupado* — en cola (posición {pos})\n{line}\n"
-            f"📨 _«{text.strip()[:60]}»_",
+        sk = _key(skey)
+        sent = await _safe_send(
+            _queue_msg_text(pos, directory, model, sid, text),
             parse_mode="Markdown",
             plain_fallback=f"⏳ Ocupado — en cola (posición {pos}). "
-                           f"{Path(directory).name} / {model}")
+                           f"{Path(directory).name} / {model}",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("❌ Cancelar cola", callback_data=f"qcancel:{sk}")]]))
+        if sent:
+            QUEUES[skey][-1]["queue_msg_id"] = sent.message_id
         return
 
     # Reserve the slot synchronously before any await to prevent a second
@@ -1590,28 +1629,30 @@ async def cmd_init(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 @admin_only
 async def cmd_tmp(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Sesión temporal en /tmp/claude-tmp (scratch, se borra al reiniciar el PC).
-    NO cambia la sesión activa: se continúa respondiendo (reply) a sus mensajes.
-    `/tmp <texto>` despacha ya; `/tmp` a secas deja un ancla para responderle."""
+    """Activa una sesión temporal en /tmp/claude-tmp y la trata como una carpeta
+    normal: pasa a ser la sesión activa, así que los mensajes normales le llegan
+    sin tener que responder a nada. El directorio vive en /tmp, por lo que se
+    borra al reiniciar el ordenador. `/tmp <texto>` despacha ya; `/tmp` a secas
+    solo la deja activa."""
     SCRATCH_DIR.mkdir(parents=True, exist_ok=True)
     cwd = str(SCRATCH_DIR)
-    skey = _skey(cwd, None)
-    meta = db.get_session_meta(_resume_for(skey) or "")
+    # Resume id if the scratch session already materialized this boot (continuity
+    # is bridged by KNOWN_SID), else None → a fresh session on first prompt.
+    sid = _resume_for(_skey(cwd, None))
+    meta = db.get_session_meta(sid) if sid else None
     model = (meta or {}).get("model") or cc.DEFAULT_MODEL
+    effort = (meta or {}).get("effort")
+    db.set_active(cwd, sid, model, effort)  # make it the active session
+    skey = _skey(cwd, sid)
     text = " ".join(ctx.args).strip() if ctx.args else ""
     if text:
-        # Dispatch straight to the temp session; its status + reply messages get
-        # tracked in MSG2SESS, so replying to any of them continues it.
-        await _dispatch(cwd, skey, model, text)
+        await _dispatch(cwd, skey, model, text, effort)
         return
-    # No prompt → post an anchor and track it, so a reply starts the conversation.
-    sent = await update.message.reply_text(
-        "🧪 *Sesión temporal* — `/tmp/claude-tmp`\n"
-        "No cambia tu sesión activa.\n\n"
-        "↩️ _Responde a este mensaje_ para hablar con ella.",
+    await update.message.reply_text(
+        _active_card(cwd, sid, model,
+                     header="🧪 *Sesión temporal activa* — `/tmp/claude-tmp`")
+        + "\n\n♻️ _Carpeta scratch: se borra al reiniciar el ordenador._",
         parse_mode="Markdown")
-    if sent:
-        _track_msg(sent.message_id, skey, cwd)
 
 
 PERM_MODES = ["bypassPermissions", "acceptEdits", "default", "plan"]
@@ -1709,6 +1750,64 @@ async def cb_abort(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await q.edit_message_text(msg, parse_mode="Markdown")
     except BadRequest:
         await APP.bot.send_message(ADMIN_ID, msg)
+
+
+async def cb_qcancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Cancel a queued (not yet running) prompt."""
+    q = update.callback_query
+    await q.answer()
+    parts = q.data.split(":", 1)
+    skey = _val(int(parts[1])) if len(parts) == 2 and parts[1].isdigit() else None
+    if not skey:
+        try:
+            await q.edit_message_text("❌ Cola expirada.")
+        except Exception:
+            pass
+        return
+    queue = QUEUES.get(skey)
+    msg_id = q.message.message_id
+    # Find the item in the queue by its message_id.
+    idx = next((i for i, it in enumerate(queue or [])
+                if it.get("queue_msg_id") == msg_id), None)
+    if idx is None or queue is None:
+        try:
+            await q.edit_message_text("✅ Ya no estaba en cola.")
+        except Exception:
+            pass
+        return
+    removed_text = queue[idx].get("text", "")
+    items = list(queue)
+    items.pop(idx)
+    queue.clear()
+    queue.extend(items)
+    if not queue:
+        QUEUES.pop(skey, None)
+    else:
+        # Renumber remaining items.
+        sid = _resume_for(skey)
+        sk = _key(skey)
+        for i, remaining in enumerate(queue, start=1):
+            rmsg_id = remaining.get("queue_msg_id")
+            if not rmsg_id:
+                continue
+            try:
+                await APP.bot.edit_message_text(
+                    _queue_msg_text(i, remaining["directory"], remaining["model"],
+                                    sid, remaining["text"]),
+                    chat_id=ADMIN_ID,
+                    message_id=rmsg_id,
+                    parse_mode="Markdown",
+                    reply_markup=InlineKeyboardMarkup([[
+                        InlineKeyboardButton("❌ Cancelar cola",
+                                             callback_data=f"qcancel:{sk}")]]))
+            except Exception:
+                pass
+    snip = removed_text.strip()[:80]
+    try:
+        await q.edit_message_text(f"🗑 *Cancelado de la cola.*\n📨 _{snip}_",
+                                  parse_mode="Markdown")
+    except Exception:
+        pass
 
 
 # --------------------------------------------------------------------------- #
@@ -2495,7 +2594,7 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 HELP = (
     "*claude-bot* — Claude Code por Telegram\n\n"
     "/open — explorar carpetas y abrir/crear sesión\n"
-    "/tmp [texto] — sesión temporal (no cambia la activa); responde a sus mensajes para seguir\n"
+    "/tmp [texto] — activa una sesión temporal en /tmp/claude-tmp (se borra al reiniciar el PC)\n"
     "/sessions — gestionar sesiones de un proyecto\n"
     "/models — cambiar modelo (fable-5/opus/sonnet/haiku)\n"
     "/refreshmodels — actualizar el catálogo de modelos\n"
@@ -2543,7 +2642,6 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(HELP, parse_mode="Markdown")
 
 
-@admin_only
 async def _git_pull_and_deps() -> tuple[str, bool]:
     """Update this checkout in place before a restart. Returns (report, proceed);
     proceed=False aborts the restart so we never relaunch into a broken env (e.g.
@@ -2586,6 +2684,7 @@ async def _git_pull_and_deps() -> tuple[str, bool]:
     return (f"✅ Actualizado a {short}; reinicio.", True)
 
 
+@admin_only
 async def cmd_restart(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     import subprocess, sys
     service = "claude-bot.service"
@@ -2737,6 +2836,7 @@ def main():
     app.add_handler(CallbackQueryHandler(cb_sendmodel, pattern=r"^sendmodel:"))
     app.add_handler(CallbackQueryHandler(cb_senddel, pattern=r"^senddel:"))
     app.add_handler(CallbackQueryHandler(cb_abort, pattern=r"^abort:"))
+    app.add_handler(CallbackQueryHandler(cb_qcancel, pattern=r"^qcancel:"))
     app.add_handler(CallbackQueryHandler(cb_commitpush, pattern=r"^commitpush:"))
     app.add_handler(CallbackQueryHandler(cb_undo_yes, pattern=r"^undoyes:"))
     app.add_handler(CallbackQueryHandler(cb_cancel, pattern=r"^cancel:"))
@@ -2757,7 +2857,7 @@ def main():
         await application.bot.set_my_commands([
             BotCommand("start", "Estado y menú"),
             BotCommand("open", "Explorar carpetas y abrir/crear sesión"),
-            BotCommand("tmp", "Sesión temporal por reply (no cambia la activa)"),
+            BotCommand("tmp", "Activa sesión temporal en /tmp/claude-tmp"),
             BotCommand("sessions", "Gestionar sesiones"),
             BotCommand("models", "Cambiar modelo"),
             BotCommand("refreshmodels", "Actualizar catálogo de modelos"),
