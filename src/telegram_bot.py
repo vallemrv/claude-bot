@@ -818,11 +818,14 @@ async def _run_task(skey: str, directory: str, prompt: str,
     # project + session they belong to (matters in multisession).
     CURRENT_CTX.set({"directory": directory, "skey": skey, "model": model})
 
+    _last_event_at = [time.monotonic()]
+
     async def _consume():
         nonlocal final, error_msg
         async for ev in cc.run(prompt, directory, model, resume_sid,
                                PERMISSION_MODE, can_use_tool, MCP_SERVER,
                                effort=effort):
+            _last_event_at[0] = time.monotonic()
             t = ev["type"]
             if t == "client":
                 if skey in RUNNING:
@@ -907,22 +910,49 @@ async def _run_task(skey: str, directory: str, prompt: str,
         except Exception:  # noqa: BLE001
             st["pre_snapshot"] = None
 
+    async def _idle_watchdog():
+        # Returns (fires) only when no event has arrived for TASK_TIMEOUT seconds.
+        # Polls every 60 s so a genuinely active long task is never killed.
+        interval = min(60, max(10, TASK_TIMEOUT // 10))
+        while True:
+            await asyncio.sleep(interval)
+            if time.monotonic() - _last_event_at[0] >= TASK_TIMEOUT:
+                return
+
+    consume_task  = asyncio.create_task(_consume())
+    watchdog_task = asyncio.create_task(_idle_watchdog())
     try:
-        # Hard wall-clock cap so a hung CLI can't pin the session forever.
-        await asyncio.wait_for(_consume(), timeout=TASK_TIMEOUT)
-    except asyncio.TimeoutError:
-        last_tool = (st.get("tool") or "") if st else ""
-        last_arg = (st.get("tool_arg") or "") if st else ""
-        tool_hint = f"\n⚙️ Último: `{last_tool}" + (f": {last_arg}`" if last_arg else "`") if last_tool else ""
-        logger.warning(f"task {skey} timed out after {TASK_TIMEOUT}s — last tool: {last_tool} {last_arg}")
-        error_msg = f"Tiempo límite agotado ({TASK_TIMEOUT}s) — tarea interrumpida.{tool_hint}"
-        await _interrupt_client(skey)
+        done, _pending = await asyncio.wait(
+            [consume_task, watchdog_task],
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        # Always tidy up the watchdog (no-op if it already finished).
+        watchdog_task.cancel()
+        await asyncio.gather(watchdog_task, return_exceptions=True)
+
+        if watchdog_task in done and consume_task not in done:
+            # Idle timeout: no event for TASK_TIMEOUT seconds while still running.
+            consume_task.cancel()
+            await asyncio.gather(consume_task, return_exceptions=True)
+            last_tool = (st.get("tool") or "") if st else ""
+            last_arg  = (st.get("tool_arg") or "") if st else ""
+            tool_hint = (f"\n⚙️ Último: `{last_tool}" +
+                         (f": {last_arg}`" if last_arg else "`")) if last_tool else ""
+            logger.warning(
+                f"task {skey} idle-timeout after {TASK_TIMEOUT}s — last tool: {last_tool} {last_arg}")
+            error_msg = f"Sin actividad durante {TASK_TIMEOUT}s — tarea interrumpida.{tool_hint}"
+            await _interrupt_client(skey)
+        elif consume_task.done() and not consume_task.cancelled():
+            exc = consume_task.exception()
+            if exc is not None:
+                raise exc
     except asyncio.CancelledError:
+        # /esc or external cancel — tidy up children then swallow so _finish runs.
+        consume_task.cancel()
+        watchdog_task.cancel()
+        await asyncio.gather(consume_task, watchdog_task, return_exceptions=True)
         logger.info(f"task {skey} cancelled")
         cancelled = True
-        # Swallow: we still want the finally to run _finish (drain queue, clean
-        # up status). Re-raising would propagate Cancelled into the finally's
-        # awaits and abort the drain.
     except Exception as exc:  # noqa: BLE001
         logger.error(f"run_task error: {exc}", exc_info=True)
         error_msg = f"Error inesperado: {exc}"
