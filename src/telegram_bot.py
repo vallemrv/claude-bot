@@ -100,7 +100,12 @@ CURRENT_CTX: contextvars.ContextVar = contextvars.ContextVar("current_ctx", defa
 # elapsed clock keeps ticking even while no events arrive.
 STATUS_MIN_INTERVAL = 2.0     # min seconds between edits to one status (rate-limit floor)
 STATUS_LIVENESS_INTERVAL = 4  # redraw at least this often so elapsed time stays fresh
-STATUS_RETRY_CAP = 10         # cap a Telegram RetryAfter backoff so a 429 can't wedge a status
+# Telegram flood control is *per chat*, not per message: N concurrent live statuses
+# editing every STATUS_MIN_INTERVAL would multiply the aggregate edit rate by N and
+# trip a flood ban (which then freezes a status for minutes). We scale both intervals
+# by the number of live statuses so the aggregate rate stays roughly constant no
+# matter how many sessions run at once. With one session this is a no-op.
+STATUS_RETRY_CAP = 120        # sanity ceiling for a Telegram RetryAfter backoff (s)
 MSG_TRACK_LIMIT = 200
 # Cualquier respuesta que no quepa en un solo mensaje de Telegram (~4096) se
 # manda como respuesta.md en vez de trocearse en varios. El corte va por debajo
@@ -250,7 +255,8 @@ def _model_rows(cb_for_model, current: str | None = None) -> list:
 def _session_card(s, meta: dict | None, cwd: str) -> str:
     """Multi-line session summary used in activation messages and restart notice."""
     model = (meta or {}).get("model") or cc.DEFAULT_MODEL
-    title = (_session_label(s).replace("`", "'").replace("*", "·"))[:50]
+    title = (_session_label(s).replace("`", "'").replace("*", "·")
+             .replace("_", "\\_"))[:70]
     branch = getattr(s, "git_branch", None)
     last_mod = getattr(s, "last_modified", None)
     file_size = getattr(s, "file_size", 0) or 0
@@ -297,7 +303,7 @@ def _active_card(cwd: str, sid: str | None, model: str | None,
     title = (meta or {}).get("title")
     lines = [header, f"📂 `{Path(cwd).name or '?'}`", f"🧩 `{model}`"]
     if title:
-        lines.append(f"💬 {title.replace('`', chr(39))[:50]}")
+        lines.append(f"💬 {title.replace('`', chr(39)).replace('_', chr(92)+'_')[:50]}")
     elif not sid:
         lines.append("🆕 _sesión nueva — envía tu primer prompt_")
     return "\n".join(lines)
@@ -315,7 +321,7 @@ def _active_line(cwd: str, sid: str | None, model: str | None) -> str:
         if s:
             title = _session_label(s)
     if title:
-        parts.append(f"💬 _{title.replace('`', chr(39))[:35]}_")
+        parts.append(f"💬 _{title.replace('`', chr(39)).replace('_', chr(92)+'_')[:35]}_")
     return " · ".join(parts)
 
 
@@ -435,7 +441,7 @@ def _build_status_text(st: dict) -> str:
     effort = st.get("effort")
     elapsed = _format_elapsed(time.time() - st.get("start_time", time.time()))
 
-    sess_label = (st.get("session_label") or "").replace("`", "'").replace("*", "·")
+    sess_label = (st.get("session_label") or "").replace("`", "'").replace("*", "·").replace("_", "\\_")
     label_line = f"💬 _{sess_label[:50]}_" if sess_label else ""
     effort_str = f" · ⚡`{effort or 'high'}`"
     lines = [
@@ -461,10 +467,10 @@ def _build_status_text(st: dict) -> str:
         if tools:
             lines.append("⚡ " + " · ".join(f"`{t}`" for t in tools[-5:]))
     if st.get("reasoning_text"):
-        snip = st["reasoning_text"][-200:].replace("`", "'").replace("*", "")
+        snip = st["reasoning_text"][-200:].replace("`", "'").replace("*", "").replace("_", "\\_")
         lines.append(f"💭 _{snip}_")
     if st.get("stream_text"):
-        snip = st["stream_text"][-200:].replace("`", "'").replace("*", "")
+        snip = st["stream_text"][-200:].replace("`", "'").replace("*", "").replace("_", "\\_")
         lines.append(f"✍️ _{snip}_")
     tok_in = st.get("tokens_input", 0)
     if tok_in:
@@ -508,7 +514,12 @@ async def _flush_status(skey: str):
     except BadRequest:
         pass
     except RetryAfter as e:
-        delay = min(float(getattr(e, "retry_after", STATUS_MIN_INTERVAL)), STATUS_RETRY_CAP)
+        # Honor the backoff Telegram actually asked for (+1s buffer). Retrying
+        # *earlier* than retry_after — as a too-low cap would force — only earns a
+        # longer flood ban, which is what wedges a status for minutes. Cap solely
+        # as a sanity ceiling, never below what Telegram requested.
+        delay = min(float(getattr(e, "retry_after", STATUS_MIN_INTERVAL)) + 1.0,
+                    STATUS_RETRY_CAP)
         st["last_update_time"] = time.time() + delay  # don't retry until backoff clears
         st["dirty"] = True
     except NetworkError:
@@ -545,19 +556,29 @@ async def _relocate_status(skey: str | None):
         pass
 
 
+def _status_intervals() -> tuple[float, float]:
+    """The per-status (min, liveness) edit intervals, scaled by how many statuses
+    are live right now. Telegram flood control is per *chat*, so N concurrent
+    statuses must each edit N× less often to keep the aggregate rate constant and
+    avoid a flood ban. With a single session this returns the base intervals."""
+    n = max(1, sum(1 for st in STATUSES.values() if st and st.get("msg_id")))
+    return STATUS_MIN_INTERVAL * n, STATUS_LIVENESS_INTERVAL * n
+
+
 def _next_flush_delay() -> float:
     """Seconds until the soonest status needs an edit. A dirty status is due once
-    STATUS_MIN_INTERVAL has passed since its last edit (the rate-limit floor); a
-    clean one is due at STATUS_LIVENESS_INTERVAL so its elapsed clock keeps moving.
-    The worker waits this long, but a fresh event can cut the wait short via the
-    wake bell. Returns 0 if something is already due."""
+    the (scaled) min interval has passed since its last edit; a clean one is due at
+    the (scaled) liveness interval so its elapsed clock keeps moving. The worker
+    waits this long, but a fresh event can cut the wait short via the wake bell.
+    Returns 0 if something is already due."""
     now = time.time()
+    min_int, live_int = _status_intervals()
     deadlines = []
     for st in list(STATUSES.values()):
         if not st or not st.get("msg_id"):
             continue
         last = st.get("last_update_time", 0)
-        span = STATUS_MIN_INTERVAL if st.get("dirty") else STATUS_LIVENESS_INTERVAL
+        span = min_int if st.get("dirty") else live_int
         deadlines.append(last + span)
     if not deadlines:
         return STATUS_LIVENESS_INTERVAL
@@ -580,13 +601,14 @@ async def _flusher_loop():
             pass
         _STATUS_WAKE.clear()
         now = time.time()
+        min_int, live_int = _status_intervals()
         for skey in list(STATUSES.keys()):
             st = STATUSES.get(skey)
             if not st or not st.get("msg_id"):
                 continue
             since = now - st.get("last_update_time", 0)
-            due = (st.get("dirty") and since >= STATUS_MIN_INTERVAL) \
-                or since >= STATUS_LIVENESS_INTERVAL
+            due = (st.get("dirty") and since >= min_int) \
+                or since >= live_int
             if due:
                 try:
                     await _flush_status(skey)
@@ -755,8 +777,11 @@ async def _finish(skey: str, directory: str, final: dict | None,
         elif pre:
             # Read-only task: the upfront snapshot is never used — drop its ref.
             await asyncio.to_thread(gitops.drop_snapshot, directory, pre)
-        await _send_reply(skey, directory, st, final,
-                          cancelled=cancelled, error_msg=error_msg)
+        # A close-initiated cancel suppresses the per-task reply: the session is
+        # being deleted and the close handler posts a single summary instead.
+        if not st.get("suppress_reply"):
+            await _send_reply(skey, directory, st, final,
+                              cancelled=cancelled, error_msg=error_msg)
     await _drain_queue(skey, directory)
 
 
@@ -1142,7 +1167,7 @@ async def _show_session_picker(q, cwd: str, sessions: list, mode: str = "activat
         if cur_sid:
             active_s = _find_session(cur_sid, cwd)
             if active_s:
-                title += f"\n✅ {_session_label(active_s).replace('`', chr(39))[:50]}"
+                title += f"\n✅ {_session_label(active_s).replace('`', chr(39)).replace('_', chr(92)+'_')[:50]}"
         sel = lambda sid: f"actsess:{_key(sid)}:{pk}"
         # :s suffix tells cb_delsess to re-render in sessions mode after delete
         dele = (lambda sid: f"delsess:{_key(sid)}:{pk}:s") if mode == "sessions" else (lambda sid: f"delsess:{_key(sid)}:{pk}")
@@ -1259,6 +1284,7 @@ async def cb_delsess(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     sid, cwd = vals
     from_sessions = len(parts) > 3 and parts[3] == "s"
+    await _cancel_running([_skey(cwd, sid)])
     try:
         sdk.delete_session(sid, directory=cwd or None)
     except Exception as exc:  # noqa: BLE001
@@ -1331,8 +1357,8 @@ async def cmd_sessions(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     header = ""
     if active_dir and active_sid:
         s = _find_session(active_sid, active_dir)
-        label = _session_label(s).replace("`", "'")[:40] if s else active_sid[:8]
-        dir_name = Path(active_dir).name.replace("`", "'")
+        label = _session_label(s).replace("`", "'").replace("_", "\\_")[:40] if s else active_sid[:8]
+        dir_name = Path(active_dir).name.replace("`", "'").replace("_", "\\_")
         header = f"✅ Activa: `{dir_name}` › {label}\n\n"
 
     btns = _project_picker_rows(by_dir, "sesspick", mark_active=True)
@@ -1358,16 +1384,106 @@ async def cb_sesspick(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                                   parse_mode="Markdown")
 
 
+def _dir_of_skey(skey: str) -> str:
+    """Best-effort directory for a live skey (RUNNING/STATUSES carry it; an
+    un-materialized session encodes it as ``new::{dir}``)."""
+    e = RUNNING.get(skey) or STATUSES.get(skey)
+    if e and e.get("directory"):
+        return e["directory"]
+    if skey.startswith("new::"):
+        return skey[len("new::"):]
+    return ""
+
+
+async def _cancel_running(skeys) -> int:
+    """Interrupt + cancel any in-flight tasks for these skeys and drop their
+    queued prompts. Called before deleting sessions so a close never leaves a
+    task running (or a queued prompt that _finish would re-dispatch into a
+    session we just deleted). The per-task final reply is suppressed — the close
+    handler reports one summary instead. Returns how many tasks were cancelled."""
+    n = 0
+    for skey in set(skeys):
+        # Drop queued prompts first so the shielded _finish drain finds nothing.
+        q = QUEUES.pop(skey, None)
+        if q:
+            for item in q:
+                mid = item.get("queue_msg_id")
+                if mid:
+                    try:
+                        await APP.bot.delete_message(ADMIN_ID, mid)
+                    except Exception:  # noqa: BLE001
+                        pass
+        st = STATUSES.get(skey)
+        if st:
+            st["suppress_reply"] = True
+        entry = RUNNING.get(skey)
+        if entry:
+            await _interrupt_client(skey)
+            task = entry.get("task")
+            if task and not task.done():
+                task.cancel()
+            n += 1
+    return n
+
+
 @admin_only
 async def cmd_close(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     by_dir = _group_by_dir(_list_sessions())
     if not by_dir:
         await update.message.reply_text("No hay proyectos con sesiones.")
         return
+    total = sum(len(v) for v in by_dir.values())
     btns = _project_picker_rows(by_dir, "closedir")
+    if len(by_dir) > 1:
+        btns.append([InlineKeyboardButton(
+            f"🗑️ Cerrar TODAS ({total})", callback_data="closeall:")])
     btns.append([InlineKeyboardButton("❌ Cancelar", callback_data="cancel:")])
     await update.message.reply_text("¿Qué proyecto cierro (borra sus sesiones)?",
                                     reply_markup=InlineKeyboardMarkup(btns))
+
+
+async def cb_closeall(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Confirmation step before wiping every session across all projects."""
+    q = update.callback_query
+    await q.answer()
+    by_dir = _group_by_dir(_list_sessions())
+    total = sum(len(v) for v in by_dir.values())
+    if not total:
+        await q.edit_message_text("No hay sesiones que cerrar.")
+        return
+    await q.edit_message_text(
+        f"⚠️ Vas a borrar *todas* las sesiones: {total} en {len(by_dir)} proyecto(s).\n"
+        "Esto no se puede deshacer.",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton(f"🗑️ Sí, borrar las {total}", callback_data="closeallok:")],
+            [InlineKeyboardButton("❌ Cancelar", callback_data="cancel:")]]))
+
+
+async def cb_closeallok(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    interrupted = await _cancel_running(set(RUNNING) | set(STATUSES) | set(QUEUES))
+    deleted = 0
+    for s in _list_sessions():
+        cwd = getattr(s, "cwd", "") or ""
+        if not cwd:
+            continue
+        try:
+            sdk.delete_session(s.session_id, directory=cwd)
+            db.forget_session(s.session_id)
+            KNOWN_SID.pop(s.session_id, None)
+            deleted += 1
+        except Exception:  # noqa: BLE001
+            pass
+    had_active = bool(db.get_active())
+    db.clear_active()
+    msg = f"✅ Todas las sesiones cerradas — {deleted} borrada(s)."
+    if interrupted:
+        msg += f"\n🛑 {interrupted} tarea(s) en curso interrumpida(s)."
+    if had_active:
+        msg += "\n⚠️ _Ya no hay sesión activa._ Usa /open."
+    await q.edit_message_text(msg, parse_mode="Markdown")
 
 
 async def cb_closedir(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -1385,6 +1501,9 @@ async def cb_closedir(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await _expired(q)
         return
     sessions = _list_sessions(directory=cwd)
+    interrupted = await _cancel_running(
+        k for k in (set(RUNNING) | set(STATUSES) | set(QUEUES))
+        if _dir_of_skey(k) == cwd)
     deleted = 0
     for s in sessions:
         try:
@@ -1399,6 +1518,8 @@ async def cb_closedir(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if cleared_active:
         db.clear_active()
     msg = f"✅ `{Path(cwd).name}` cerrado — {deleted} sesión(es) borradas."
+    if interrupted:
+        msg += f"\n🛑 {interrupted} tarea(s) en curso interrumpida(s)."
     if cleared_active:
         msg += "\n⚠️ _Era tu proyecto activo: ya no hay sesión activa._ Usa /open."
     await q.edit_message_text(msg, parse_mode="Markdown")
@@ -2344,7 +2465,7 @@ async def cb_sendsess(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     meta = db.get_session_meta(sid)
     model = (meta or {}).get("model") or cc.DEFAULT_MODEL
     s = _find_session(sid, cwd)
-    sess_name = _session_label(s).replace("`", "'")[:35] if s else sid[:8]
+    sess_name = _session_label(s).replace("`", "'").replace("_", "\\_")[:35] if s else sid[:8]
     label = f"`{Path(cwd).name}` › {sess_name}"
     await _send_to_target(q, cwd, sid, model, label)
 
@@ -2853,6 +2974,8 @@ def main():
     app.add_handler(CallbackQueryHandler(cb_delsess, pattern=r"^delsess:"))
     app.add_handler(CallbackQueryHandler(cb_sesspick, pattern=r"^sesspick:"))
     app.add_handler(CallbackQueryHandler(cb_closedir, pattern=r"^closedir:"))
+    app.add_handler(CallbackQueryHandler(cb_closeallok, pattern=r"^closeallok:"))
+    app.add_handler(CallbackQueryHandler(cb_closeall, pattern=r"^closeall:"))
     app.add_handler(CallbackQueryHandler(cb_perm_mode, pattern=r"^perm:"))
     app.add_handler(CallbackQueryHandler(cb_perm_answer, pattern=r"^pa:"))
     app.add_handler(CallbackQueryHandler(cb_q_answer, pattern=r"^qa:"))
@@ -2928,8 +3051,8 @@ def main():
                      "Estas tareas se interrumpieron (no se perdió tu historial, "
                      "pero conviene revisarlas):"]
             for o in orphans[:10]:
-                name = Path(o.get("directory", "")).name or "?"
-                prm = (o.get("prompt") or "").replace("\n", " ")[:50]
+                name = (Path(o.get("directory", "")).name or "?").replace("_", "\\_")
+                prm = (o.get("prompt") or "").replace("\n", " ").replace("_", "\\_")[:50]
                 lines.append(f"• 📂 `{name}` — _{prm}_" if prm else f"• 📂 `{name}`")
             try:
                 await application.bot.send_message(
@@ -2941,6 +3064,9 @@ def main():
             try:
                 mid = int(RESTART_FLAG.read_text().strip())
                 RESTART_FLAG.unlink(missing_ok=True)
+            except Exception:  # noqa: BLE001
+                RESTART_FLAG.unlink(missing_ok=True)
+            else:
                 lines = ["✅ *Bot reiniciado*"]
                 active = db.get_active()
                 if active and active.get("claude_session_id"):
@@ -2957,11 +3083,18 @@ def main():
                     cwd = active.get("directory", "")
                     model = active.get("model") or cc.DEFAULT_MODEL
                     lines.append(f"\n📂 `{Path(cwd).name}` · 🧩 `{model}` · (nueva sesión)")
-                await application.bot.edit_message_text(
-                    chat_id=ADMIN_ID, message_id=mid,
-                    text="\n".join(lines), parse_mode="Markdown")
-            except Exception:  # noqa: BLE001
-                RESTART_FLAG.unlink(missing_ok=True)
+                try:
+                    await application.bot.edit_message_text(
+                        chat_id=ADMIN_ID, message_id=mid,
+                        text="\n".join(lines), parse_mode="Markdown")
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(f"post_init edit_message_text failed: {exc}")
+                    try:
+                        await application.bot.edit_message_text(
+                            chat_id=ADMIN_ID, message_id=mid,
+                            text="\n".join(lines))
+                    except Exception as exc2:  # noqa: BLE001
+                        logger.warning(f"post_init edit fallback also failed: {exc2}")
 
     app.post_init = post_init
     logger.info("claude-bot starting (permission_mode=%s, workspace=%s)",
