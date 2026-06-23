@@ -2842,7 +2842,6 @@ def main():
     app.add_handler(CommandHandler("exitmulti", cmd_exitmulti))
     app.add_handler(CommandHandler("esc", cmd_esc))
     app.add_handler(CommandHandler("restart", cmd_restart))
-
     app.add_handler(CallbackQueryHandler(cb_ob, pattern=r"^ob:"))
     app.add_handler(CallbackQueryHandler(cb_mkdir, pattern=r"^mkdir:"))
     app.add_handler(CallbackQueryHandler(cb_os, pattern=r"^os:"))
