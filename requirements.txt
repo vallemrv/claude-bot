@@ -1,4 +1,4 @@
 python-telegram-bot==21.11.1
-claude-agent-sdk>=0.2.87
+claude-agent-sdk>=0.2.110
 python-dotenv>=1.0
 httpx>=0.27

@@ -188,6 +188,25 @@ def _resume_for(skey: str) -> str | None:
     return KNOWN_SID.get(skey)
 
 
+def _canonical_skey(skey: str) -> str:
+    """Map a skey to the key under which its task is actually tracked.
+
+    A brand-new session runs its first prompt under the placeholder key
+    `new::{dir}`; that's what lands in STATUSES/RUNNING/QUEUES. But once the
+    `session` event materializes a real id (and the active pointer is updated to
+    it), a later message resolves to that real id instead — which is NOT in
+    STATUSES, so the busy-check would miss and dispatch a *second* concurrent
+    task for the same session. Resolve the real id back to the live placeholder
+    so both are seen as one session (queued, not run in parallel).
+    """
+    if skey in STATUSES:
+        return skey
+    for placeholder, real in KNOWN_SID.items():
+        if real == skey and placeholder in STATUSES:
+            return placeholder
+    return skey
+
+
 def _session_label(s) -> str:
     sid = getattr(s, "session_id", "")
     if sid:
@@ -997,6 +1016,7 @@ def _queue_msg_text(pos: int, directory: str, model: str, sid: str | None, text:
 async def _dispatch(directory: str, skey: str, model: str, text: str,
                     effort: str | None = None):
     """Send a prompt: create the status message and launch the task (or queue)."""
+    skey = _canonical_skey(skey)  # fold a materialized new-session id back onto its live placeholder
     if skey in STATUSES:  # busy → queue
         QUEUES.setdefault(skey, deque()).append(
             {"text": text, "directory": directory, "model": model, "effort": effort})
@@ -2567,10 +2587,9 @@ async def handle_file(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await msg.reply_text("❌ No hay sesión activa. Usa /open.")
         return
     cwd = active["directory"]
-    # Sanitize: strip any directory components so a crafted name like "../x"
-    # or "/etc/x" can't write outside the project folder.
     safe_name = Path(file_name).name or f"file_{int(time.time())}"
-    save_path = Path(cwd) / safe_name
+    TMP_DIR.mkdir(parents=True, exist_ok=True)
+    save_path = TMP_DIR / safe_name
     # Anti-collision: never silently overwrite an existing file.
     if save_path.exists():
         stem, suffix = save_path.stem, save_path.suffix
@@ -2582,7 +2601,8 @@ async def handle_file(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     except Exception as exc:  # noqa: BLE001
         await msg.reply_text(f"❌ Error al guardar: {exc}")
         return
-    await msg.reply_text(f"✅ `{safe_name}` guardado en `{Path(cwd).name}`.",
+    await msg.reply_text(f"✅ `{safe_name}` guardado en `/tmp/claude-bot-media`.\n"
+                         f"📋 Cópialo a `{Path(cwd).name}` si quieres conservarlo.",
                          parse_mode="Markdown")
 
 
@@ -2696,9 +2716,10 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             data["future"].set_result(text)
             await update.message.reply_text("✅ Respuesta enviada a Claude.")
             await _relocate_status(data.get("skey"))
-        else:
-            await update.message.reply_text("⚠️ La pregunta expiró.")
-        return
+            return
+        # The question already resolved/expired (answered via button, timed out,
+        # or you ran a command meanwhile). Don't swallow this message with a stale
+        # "expiró" — drop the dead flag and route it normally to the active session.
 
     # Resolve target: reply > send target > active
     reply = update.message.reply_to_message
